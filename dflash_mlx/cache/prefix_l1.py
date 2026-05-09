@@ -256,6 +256,35 @@ class DFlashPrefixCache:
                 elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
             )
 
+    def insert_l2_only(self, snapshot: DFlashPrefixSnapshot) -> None:
+        """Write snapshot to L2 only — do NOT keep in L1 GPU memory.
+
+        Used for checkpoint snapshots during prefill.  These are too many
+        and too large to keep in unified memory; L2 cold recovery is fast
+        enough (50-100 ms) compared to a full prefill (30-90 s).
+
+        Uses async background writer to avoid blocking the prefill thread.
+        Falls back to sync L1 insert if L2 is not configured.
+        """
+        if self._l2 is None:
+            # No L2 configured — must keep in L1 as fallback.
+            self.insert(snapshot)
+            return
+        t_start = time.perf_counter_ns()
+        # Async: serialize + enqueue background write, returns immediately.
+        # Cold recovery may miss temporarily queued writes, but that's
+        # cheaper than a blocked prefill thread.
+        self._l2.insert_async(snapshot)
+        self._stats["l2_direct_writes"] = self._stats.get("l2_direct_writes", 0) + 1
+        self._log_cache(
+            op="insert_l2",
+            kind=snapshot.kind,
+            prefix_len=int(snapshot.prefix_len),
+            nbytes=int(snapshot.nbytes),
+            entries=len(self._entries),
+            elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
+        )
+
     def set_trace_config(self, trace_config: Optional[TraceConfig]) -> None:
         self._trace_config = trace_config
 
@@ -275,6 +304,12 @@ class DFlashPrefixCache:
             n = len(existing.token_ids)
             if n <= len(incoming) and incoming[:n] == existing.token_ids:
                 if same_kind:
+                    # Keep prefill checkpoints even when a longer prefill
+                    # snapshot arrives. They are safe restore points for
+                    # agentic prompts whose later sections diverge; LRU/byte
+                    # pressure can still evict them and spill to L2.
+                    if existing.kind == "prefill" and snapshot.kind == "prefill":
+                        continue
                     doomed_same.append(eid)
                 else:
                     doomed_cross.append(eid)

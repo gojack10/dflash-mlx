@@ -44,6 +44,7 @@ def make_prefix_cache(runtime_context: Any) -> DFlashPrefixCache:
         l2=l2,
         trace_config=trace_config,
         max_snapshot_tokens=runtime_config.max_snapshot_tokens,
+        cross_kind_prune=False,
     )
     sys.stderr.write(
         f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefix cache enabled "

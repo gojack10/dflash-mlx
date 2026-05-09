@@ -282,6 +282,29 @@ def stream_dflash_generate_impl(
                 yield evt
                 _yield_done(_pre_yield)
 
+            # Agentic prompts often diverge in the middle while still sharing a
+            # large leading prefix. A single snapshot at the final stable
+            # boundary makes prefix reuse all-or-nothing. Emit safe checkpoint
+            # snapshots after completed prefill chunks so future requests can
+            # hydrate the longest byte-identical prefix before a divergence.
+            # This preserves correctness for hybrid FA+GDN models because the
+            # checkpoint is captured from a real forward pass boundary rather
+            # than by cropping recurrent state.
+            if supports_prefix_snapshot and chunk_end > snap_prefix_len:
+                _pre_yield = _yield_start()
+                yield {
+                    "event": "prefill_snapshot_ready",
+                    "token_ids": list(prompt_tokens[:chunk_end]),
+                    "target_cache": target_cache,
+                    "target_hidden": target_hidden[:, :chunk_end, :] if target_hidden is not None else None,
+                    "last_logits": prefill_logits[:, -1, :] if prefill_logits is not None else None,
+                    "from_snapshot": bool(snap_prefix_len > 0),
+                    "snap_prefix_len": snap_prefix_len,
+                    "snapshot_boundary": int(chunk_end),
+                    "checkpoint": True,
+                }
+                _yield_done(_pre_yield)
+
         if (
             snap_prefix_len > 0
             and snap_prefix_len == snapshot_boundary

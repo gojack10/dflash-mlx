@@ -163,7 +163,22 @@ class PrefixCacheFlow:
         )
 
     def handle_prefill_snapshot(self, event: dict[str, Any]) -> None:
-        self._insert_snapshot(event, kind="prefill", require_logits=True)
+        import sys, time
+        token_ids = event.get("token_ids") or []
+        has_logits = event.get("last_logits") is not None
+        has_cache = event.get("target_cache") is not None
+        has_hidden = event.get("target_hidden") is not None
+        checkpoint = bool(event.get("checkpoint", False))
+        sys.stderr.write(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] "
+            f"prefill_snapshot event: tokens={len(token_ids)} "
+            f"checkpoint={'yes' if checkpoint else 'no'} "
+            f"logits={'yes' if has_logits else 'NO'} "
+            f"cache={'yes' if has_cache else 'NO'} "
+            f"hidden={'yes' if has_hidden else 'NO'}\n"
+        )
+        sys.stderr.flush()
+        self._insert_snapshot(event, kind="prefill", require_logits=True, l2_only=checkpoint)
 
     def handle_generation_snapshot(self, event: dict[str, Any]) -> None:
         self._insert_snapshot(event, kind="generation", require_logits=False)
@@ -174,6 +189,7 @@ class PrefixCacheFlow:
         *,
         kind: str,
         require_logits: bool,
+        l2_only: bool = False,
     ) -> None:
         if self.cache is None or self.key is None:
             return
@@ -185,10 +201,17 @@ class PrefixCacheFlow:
             if (
                 target_cache is None
                 or target_hidden is None
-                or (require_logits and last_logits is None)
                 or not target_cache_is_serializable(target_cache)
             ):
                 return
+            import sys as _sys, time as _time
+            _sys.stderr.write(
+                f"{_time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] "
+                f"_insert_snapshot kind={kind} tokens={len(token_ids)} "
+                f"logits={'yes' if last_logits is not None else 'no'} "
+                f"l2_only={'yes' if l2_only else 'no'}\n"
+            )
+            _sys.stderr.flush()
             snap = build_snapshot(
                 token_ids=list(token_ids),
                 target_cache=target_cache,
@@ -205,8 +228,19 @@ class PrefixCacheFlow:
                 ),
             )
             insert_t0 = time.perf_counter_ns()
-            self.cache.insert(snap)
+            if l2_only:
+                self.cache.insert_l2_only(snap)
+            else:
+                self.cache.insert(snap)
             self.insert_ms += (time.perf_counter_ns() - insert_t0) / 1e6
+            import sys as _s2, time as _t2
+            _s2.stderr.write(
+                f"{_t2.strftime('%Y-%m-%d %H:%M:%S')} [dflash] "
+                f"snapshot INSERTED kind={kind} tokens={len(token_ids)} "
+                f"l2_only={'yes' if l2_only else 'no'} "
+                f"entries={len(self.cache._entries)}\n"
+            )
+            _s2.stderr.flush()
             if kind == "generation":
                 sys.stderr.write(
                     f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
