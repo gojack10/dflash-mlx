@@ -26,6 +26,10 @@ class RuntimeProfile:
     prefix_cache_l2: bool
     prefix_cache_l2_max_bytes: int
     verify_mode: str
+    speculative_mode: str = "dflash"
+    ddtree_budget: int = 16
+    ddtree_topk: int = 64
+    ddtree_dense_mask: bool = False
 
 @dataclass(frozen=True)
 class EffectiveRuntimeConfig:
@@ -47,6 +51,10 @@ class EffectiveRuntimeConfig:
     memory_waterfall: bool
     bench_log_dir: str
     verify_mode: str
+    speculative_mode: str
+    ddtree_budget: int
+    ddtree_topk: int
+    ddtree_dense_mask: bool
 
 PROFILES: dict[str, RuntimeProfile] = {
     "balanced": RuntimeProfile(
@@ -244,6 +252,26 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
         memory_waterfall=bool(getattr(args, "memory_waterfall", None) or False),
         bench_log_dir=str(getattr(args, "bench_log_dir", None) or ""),
         verify_mode=_resolve_verify_mode(getattr(args, "verify_mode", None), profile.verify_mode),
+        speculative_mode=_resolve_str(
+            getattr(args, "speculative_mode", None),
+            "DFLASH_SPECULATIVE_MODE",
+            profile.speculative_mode,
+        ),
+        ddtree_budget=_resolve_int(
+            getattr(args, "ddtree_budget", None),
+            "DFLASH_DDTREE_BUDGET",
+            profile.ddtree_budget,
+        ),
+        ddtree_topk=_resolve_int(
+            getattr(args, "ddtree_topk", None),
+            "DFLASH_DDTREE_TOPK",
+            profile.ddtree_topk,
+        ),
+        ddtree_dense_mask=_resolve_bool(
+            getattr(args, "ddtree_dense_mask", None),
+            "DFLASH_DDTREE_DENSE_MASK",
+            profile.ddtree_dense_mask,
+        ),
     )
     return validate_runtime_config(cfg)
 
@@ -280,6 +308,12 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--dflash-max-ctx / dflash_max_ctx must be >= 0")
     if cfg.verify_mode not in ("auto", "off"):
         raise ValueError("--verify-mode / verify_mode must be auto or off")
+    if cfg.speculative_mode not in ("dflash", "ddtree"):
+        raise ValueError("--speculative-mode must be dflash or ddtree")
+    if cfg.ddtree_budget <= 0:
+        raise ValueError("--ddtree-budget / ddtree_budget must be > 0")
+    if cfg.ddtree_topk <= 0:
+        raise ValueError("--ddtree-topk / ddtree_topk must be > 0")
     if cfg.bench_log_dir != "" and not cfg.bench_log_dir.strip():
         raise ValueError("--bench-log-dir / bench_log_dir must not be empty")
     if not cfg.prefix_cache and cfg.prefix_cache_l2:

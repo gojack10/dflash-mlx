@@ -45,6 +45,10 @@ def runtime_config_from_profile(
     memory_waterfall: bool = False,
     bench_log_dir: str = "",
     verify_mode: str | None = None,
+    speculative_mode: str | None = None,
+    ddtree_budget: int | None = None,
+    ddtree_topk: int | None = None,
+    ddtree_dense_mask: bool | None = None,
 ) -> EffectiveRuntimeConfig:
     runtime_profile = PROFILES[profile]
     return validate_runtime_config(
@@ -105,6 +109,10 @@ def runtime_config_from_profile(
             memory_waterfall=bool(memory_waterfall),
             bench_log_dir=str(bench_log_dir),
             verify_mode=runtime_profile.verify_mode if verify_mode is None else str(verify_mode),
+            speculative_mode=runtime_profile.speculative_mode if speculative_mode is None else str(speculative_mode),
+            ddtree_budget=runtime_profile.ddtree_budget if ddtree_budget is None else int(ddtree_budget),
+            ddtree_topk=runtime_profile.ddtree_topk if ddtree_topk is None else int(ddtree_topk),
+            ddtree_dense_mask=runtime_profile.ddtree_dense_mask if ddtree_dense_mask is None else bool(ddtree_dense_mask),
         )
     )
 

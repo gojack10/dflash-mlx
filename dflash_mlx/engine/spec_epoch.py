@@ -506,9 +506,13 @@ def stream_dflash_generate_impl(
             "other": 0,
             "cycle_total": 0,
         }
+        ddtree_mode = str(getattr(runtime_config, "speculative_mode", "dflash")).lower() == "ddtree"
+        ddtree_budget = int(getattr(runtime_config, "ddtree_budget", 64) or 64)
+        ddtree_topk = int(getattr(runtime_config, "ddtree_topk", 64) or 64)
         prefetched_draft: Optional[dict[str, Any]] = None
 
         while len(generated_token_ids) < max_new_tokens:
+            _ddtree_cycle = False
             cycle_start_ns = time.perf_counter_ns() if profile_cycles else 0
             draft_cycle_ns = 0
             verify_cycle_ns = 0
@@ -524,10 +528,13 @@ def stream_dflash_generate_impl(
             current_staged_first = staged_first
             drafted = None
 
+            draft_logit_tensor: Any = None  # captured for DDTree mode
             if block_len > 1:
-                if profile_cycles:
+                if ddtree_mode:
+                    # DDTree mode: capture draft logits for tree construction.
+                    # We also still need drafted tokens for the verify fallback.
                     draft_start_ns = time.perf_counter_ns()
-                    drafted = draft_backend.draft_greedy(
+                    draft_logit_tensor = draft_backend.draft_logits(
                         target_model=target_model,
                         draft_model=draft_model,
                         draft_cache=draft_cache,
@@ -535,13 +542,19 @@ def stream_dflash_generate_impl(
                         target_hidden=target_hidden,
                         block_len=block_len,
                         mask_token_tail=mask_token_tail,
-                        suppress_token_mask=suppress_token_mask,
-                        async_launch=False,
                     )
-                    mx.eval(drafted)
+                    from dflash_mlx import runtime as runtime_mod
+                    drafted = runtime_mod.greedy_tokens_with_mask(
+                        draft_logit_tensor,
+                        suppress_token_mask,
+                    ).squeeze(0)
+                    if profile_cycles:
+                        mx.eval(drafted)
+                    else:
+                        mx.async_eval(drafted)
                     draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
                     block_token_ids[1:block_len] = drafted
-                else:
+                elif profile_cycles:
                     if (
                         prefetched_draft is not None
                         and int(prefetched_draft["block_len"]) == block_len
@@ -571,64 +584,165 @@ def stream_dflash_generate_impl(
                     draft_incremental_ns += draft_cycle_ns
 
             verify_token_count = verify_token_count_for_block(block_len, verify_len_cap)
-            if profile_cycles or block_len <= 1:
-                verify_token_ids = block_token_ids[:verify_token_count]
-            elif verify_token_count <= 1:
-                verify_token_ids = current_staged_first[:1]
-            else:
-                verify_token_ids = mx.concatenate(
-                    [current_staged_first[:1], drafted[: verify_token_count - 1]],
-                    axis=0,
-                )
-            verify_ids = verify_token_ids[None]
-            target_ops.arm_rollback(target_cache, prefix_len=start)
-            sample_memory_cycle = memory_waterfall and _should_sample_memory_cycle(
-                cycles_completed + 1
-            )
-            if sample_memory_cycle:
-                evt = _waterfall_event(
-                    "before_verify_cycle",
-                    target_hidden_value=target_hidden,
-                    gen_hidden_chunks_value=gen_hidden_chunks,
-                    extra={"cycle": int(cycles_completed + 1), "start": int(start)},
-                )
-                if evt is not None:
-                    _pre_yield = _yield_start()
-                    yield evt
-                    _yield_done(_pre_yield)
-            verify_start_ns = time.perf_counter_ns()
-            verify_logits, verify_hidden_states = target_ops.verify_block(
-                target_model=target_model,
-                verify_ids=verify_ids,
-                target_cache=target_cache,
-                capture_layer_ids=capture_layer_ids,
-            )
-            if profile_cycles:
-                _eval_logits_and_captured(verify_logits, verify_hidden_states)
-            verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
-            verify_ns_total += verify_cycle_ns
-            if sample_memory_cycle:
-                evt = _waterfall_event(
-                    "after_verify_cycle",
-                    target_hidden_value=target_hidden,
-                    gen_hidden_chunks_value=gen_hidden_chunks,
-                    extra={"cycle": int(cycles_completed + 1), "start": int(start)},
-                )
-                if evt is not None:
-                    _pre_yield = _yield_start()
-                    yield evt
-                    _yield_done(_pre_yield)
 
-            acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
-            posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
-            if not profile_cycles:
-                mx.async_eval(posterior)
-            acceptance_len = int(
-                _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
-            )
-            acceptance_history.append(acceptance_len)
-            if profile_cycles:
-                acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
+            if ddtree_mode and draft_logit_tensor is not None and block_len > 1:
+                # ── DDTree verification path ──
+                from vllm_mlx.engine.ddtree import (
+                    build_ddtree_tree_from_mlx,
+                    compile_tree,
+                    follow_verified_tree as _follow_verified_tree,
+                    tree_verify_forward,
+                )
+
+                # draft_logit_tensor has shape (1, block_len-1, vocab)
+                draft_logits_2d = draft_logit_tensor.squeeze(0)
+                tree = build_ddtree_tree_from_mlx(draft_logits_2d, budget=ddtree_budget)
+                mx.eval()  # sync: tree build complete, CPU data ready
+
+                # Compile tree
+                root_token = int(staged_first.item())
+                ct = compile_tree(tree, root_token_id=root_token, prefix_len=start)
+
+                sys.stderr.write(
+                    f"[ddtree] tree_size={ct.tree_size} root={root_token} "
+                    f"prefix_len={start}\n"
+                )
+                sys.stderr.flush()
+
+                # Arm rollback, verify tree forward, walk
+                target_ops.arm_rollback(target_cache, prefix_len=start)
+                verify_start_ns = time.perf_counter_ns()
+                tree_logits, tree_hidden_states = tree_verify_forward(
+                    target_model,
+                    compiled_tree=ct,
+                    cache=target_cache,
+                    capture_layer_ids=capture_layer_ids,
+                )
+                verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
+                verify_ns_total += verify_cycle_ns
+                mx.eval()  # sync: verify forward complete
+                sys.stderr.write(
+                    f"[ddtree] verify complete: {verify_cycle_ns/1e6:.1f}ms\n"
+                )
+                sys.stderr.flush()
+
+                # Walk tree
+                posterior_tokens = greedy_tokens_with_mask(tree_logits[0], suppress_token_mask)
+                posterior_list = posterior_tokens.tolist()
+                accepted_indices, bonus_token = _follow_verified_tree(
+                    tree.child_maps, posterior_list
+                )
+                acceptance_len = len(accepted_indices) - 1  # minus root
+                acceptance_history.append(acceptance_len)
+
+                # ── Use tree logits directly, skip re-verify ──
+                # Extract accepted node logits and hidden states from tree results.
+                accepted_array = mx.array(accepted_indices, dtype=mx.int32)
+                verify_logits = mx.take(tree_logits[:, accepted_array, :], mx.array([0]), axis=0)
+                # Reconstruct hidden states for accepted nodes
+                captured_dict: dict[int, mx.array] = {}
+                for lid, hid in tree_hidden_states.items():
+                    captured_dict[lid] = mx.take(hid, accepted_array, axis=1)
+
+                # Compact KV: restore_after_acceptance keeps first (1+acceptance_len)
+                # tree nodes and discards the rest. Works when accepted nodes are
+                # contiguous in tree-index order (common for small budgets).
+                target_len = start + 1 + acceptance_len
+                drafted_tokens = tree.tree_size - 1
+                replay_cycle_ns = target_ops.restore_after_acceptance(
+                    target_cache,
+                    target_len=target_len,
+                    acceptance_length=acceptance_len,
+                    drafted_tokens=drafted_tokens,
+                )
+                replay_ns_total += replay_cycle_ns
+                mx.eval()  # sync: restore complete
+
+                # Build accepted token sequence (for token yielding + committed_segment)
+                accepted_path_ids = [int(staged_first.item())]
+                for idx in accepted_indices[1:]:
+                    accepted_path_ids.append(int(tree.node_token_ids[idx - 1]))
+                verify_token_ids = mx.array(accepted_path_ids, dtype=mx.uint32)
+                verify_hidden_states = captured_dict
+
+                # Set verify_logits for downstream (posterior extract)
+                # verify_logits already set above from tree
+
+                # Flag: shared code should skip its own acceptance computation
+                # and second restore — we already did both above.
+                _ddtree_cycle = True
+
+                # Memory waterfall not sampled in DDTree path yet
+                sample_memory_cycle = False
+
+            else:
+                _ddtree_cycle = False
+                # ── Vanilla DFlash verify path ──
+                if profile_cycles or block_len <= 1:
+                    verify_token_ids = block_token_ids[:verify_token_count]
+                elif verify_token_count <= 1:
+                    verify_token_ids = current_staged_first[:1]
+                else:
+                    verify_token_ids = mx.concatenate(
+                        [current_staged_first[:1], drafted[: verify_token_count - 1]],
+                        axis=0,
+                    )
+                verify_ids = verify_token_ids[None]
+                target_ops.arm_rollback(target_cache, prefix_len=start)
+                sample_memory_cycle = memory_waterfall and _should_sample_memory_cycle(
+                    cycles_completed + 1
+                )
+                if sample_memory_cycle:
+                    evt = _waterfall_event(
+                        "before_verify_cycle",
+                        target_hidden_value=target_hidden,
+                        gen_hidden_chunks_value=gen_hidden_chunks,
+                        extra={"cycle": int(cycles_completed + 1), "start": int(start)},
+                    )
+                    if evt is not None:
+                        _pre_yield = _yield_start()
+                        yield evt
+                        _yield_done(_pre_yield)
+                verify_start_ns = time.perf_counter_ns()
+                verify_logits, verify_hidden_states = target_ops.verify_block(
+                    target_model=target_model,
+                    verify_ids=verify_ids,
+                    target_cache=target_cache,
+                    capture_layer_ids=capture_layer_ids,
+                )
+                if profile_cycles:
+                    _eval_logits_and_captured(verify_logits, verify_hidden_states)
+                verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
+                verify_ns_total += verify_cycle_ns
+                if sample_memory_cycle:
+                    evt = _waterfall_event(
+                        "after_verify_cycle",
+                        target_hidden_value=target_hidden,
+                        gen_hidden_chunks_value=gen_hidden_chunks,
+                        extra={"cycle": int(cycles_completed + 1), "start": int(start)},
+                    )
+                    if evt is not None:
+                        _pre_yield = _yield_start()
+                        yield evt
+                        _yield_done(_pre_yield)
+
+            if not _ddtree_cycle:
+                acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
+                posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+                if not profile_cycles:
+                    mx.async_eval(posterior)
+                acceptance_len = int(
+                    _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
+                )
+                acceptance_history.append(acceptance_len)
+                if profile_cycles:
+                    acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
+            else:
+                # DDTree already computed acceptance via tree walk.
+                # posterior = target model greedy at each accepted node.
+                # Use verify_logits for the accepted nodes to extract posterior.
+                posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+                acceptance_cycle_ns = 0
             hidden_extract_start_ns = time.perf_counter_ns() if profile_cycles else 0
             committed_hidden = target_ops.extract_context_feature(
                 verify_hidden_states,
@@ -649,12 +763,15 @@ def stream_dflash_generate_impl(
             if supports_prefix_snapshot:
                 gen_hidden_chunks.append(committed_hidden)
             last_cycle_logits = verify_logits[:, acceptance_len, :]
-            replay_cycle_ns = target_ops.restore_after_acceptance(
-                target_cache,
-                target_len=start,
-                acceptance_length=acceptance_len,
-                drafted_tokens=max(0, verify_token_count - 1),
-            )
+            if not _ddtree_cycle:
+                replay_cycle_ns = target_ops.restore_after_acceptance(
+                    target_cache,
+                    target_len=start,
+                    acceptance_length=acceptance_len,
+                    drafted_tokens=max(0, verify_token_count - 1),
+                )
+            else:
+                replay_cycle_ns = 0  # already restored in DDTree path
             if sample_memory_cycle:
                 evt = _waterfall_event(
                     "after_rollback",

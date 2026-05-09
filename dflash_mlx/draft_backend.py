@@ -78,5 +78,45 @@ class EagerDraftBackend:
             mx.eval(draft_logits)
         return drafted
 
+    def draft_logits(
+        self,
+        *,
+        target_model: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        staged_first: mx.array,
+        target_hidden: mx.array,
+        block_len: int,
+        mask_token_tail: mx.array,
+    ) -> mx.array:
+        """Return raw per-position logits for DDTree construction.
+
+        Same forward pass as draft_greedy but returns the [B-1, vocab]
+        logits tensor instead of argmax tokens.  Caller is responsible for
+        evaluating / transferring data.
+
+        Returns
+        -------
+        mx.array  shape (block_len - 1, vocab_size)  dtype=float32
+        """
+        if int(block_len) <= 1:
+            raise ValueError("draft_logits requires block_len > 1")
+
+        block_token_ids = mx.concatenate(
+            [staged_first[:1], mask_token_tail[: int(block_len) - 1]],
+            axis=0,
+        )
+        target_ops = resolve_target_ops(target_model)
+        noise_embedding = target_ops.embed_tokens(target_model)(block_token_ids[None])
+        draft_hidden = draft_model(
+            noise_embedding=noise_embedding,
+            target_hidden=target_hidden,
+            cache=draft_cache,
+        )
+        return target_ops.logits_from_hidden(
+            target_model, draft_hidden[:, 1:, :]
+        )
+
+
 def make_draft_backend() -> EagerDraftBackend:
     return EagerDraftBackend()
