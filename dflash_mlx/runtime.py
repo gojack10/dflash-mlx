@@ -107,29 +107,36 @@ def apply_repetition_penalty(
     generated_token_ids: list[int],
     penalty: float,
 ) -> mx.array:
-    """Apply repetition penalty to logits in-place (lazy).
+    """Apply count-aware repetition penalty to logits.
 
-    Penalizes tokens that have already appeared in the full conversation
-    (prompt + generated tokens). For each such token, divide positive logits
-    or multiply negative logits by *penalty*.  A penalty of 1.0 is a no-op.
+    Effective penalty per token is ``penalty ** count`` where *count* is the
+    number of occurrences in the full conversation (prompt + generated). The
+    set-based form (penalty applied once regardless of count) collapses under
+    long-context greedy verification: with most of the vocabulary already
+    seen, the downshift is roughly uniform and the local fixed point of a
+    looping paragraph survives. Scaling by count breaks that fixed point —
+    tokens that appear N times get N× more penalty.
     """
     if penalty == 1.0 or not generated_token_ids:
         return logits
-    unique_ids = sorted(set(generated_token_ids))
-    if not unique_ids:
+    from collections import Counter
+
+    counts = Counter(generated_token_ids)
+    if not counts:
         return logits
-    # Build a boolean mask for tokens that should be penalized
     vocab_size = int(logits.shape[-1])
-    valid_ids = [tid for tid in unique_ids if 0 <= tid < vocab_size]
-    if not valid_ids:
+    valid_items = [(tid, c) for tid, c in counts.items() if 0 <= tid < vocab_size]
+    if not valid_items:
         return logits
-    idx = mx.array(valid_ids, dtype=mx.int32)
-    # Fetch penalized logits, apply penalty, scatter back
+    ids = [tid for tid, _ in valid_items]
+    factors_py = [penalty ** c for _, c in valid_items]
+    idx = mx.array(ids, dtype=mx.int32)
+    factors = mx.array(factors_py, dtype=logits.dtype)
     penalized = mx.take(logits, idx, axis=-1)
     penalized = mx.where(
         penalized > 0,
-        penalized / penalty,
-        penalized * penalty,
+        penalized / factors,
+        penalized * factors,
     )
     scatter_idx = idx.reshape((1,) * (logits.ndim - 1) + (-1,))
     return mx.put_along_axis(logits, scatter_idx, penalized, axis=-1)
