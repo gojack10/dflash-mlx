@@ -48,6 +48,27 @@ def _clear_cache_transients(cache_entry: Any) -> None:
             setattr(cache_entry, attr, False if attr == "_armed" else None)
 
 
+def _auto_draft_block_tokens(draft_model: DFlashDraftModel, fallback: int) -> int:
+    """Choose the measured best speculative block size for known DFlash drafts."""
+    args = getattr(draft_model, "args", None)
+    hidden_size = int(getattr(args, "hidden_size", 0) or 0)
+    target_layers = int(getattr(args, "num_target_layers", 0) or 0)
+    draft_layers = int(getattr(args, "num_hidden_layers", 0) or 0)
+
+    # Qwen3.6-27B dense DFlash: 32 was the best measured code-like prompt
+    # setting. Longer 48/64 blocks only won on synthetic/repetitive text and
+    # regressed mixed prompts because failed long drafts add useless work.
+    if hidden_size >= 4096 and target_layers >= 60:
+        return 32
+
+    # Qwen3.6-35B-A3B MoE DFlash: the drafter's native block size (16 today)
+    # was fastest in local DDTree measurements; 32/48/64 reduced tok/s.
+    if hidden_size <= 3072 and target_layers == 40 and draft_layers >= 8:
+        return int(fallback)
+
+    return int(fallback)
+
+
 def _commit_ddtree_target_cache(
     target_cache: list[Any],
     *,
@@ -595,11 +616,15 @@ def stream_dflash_generate_impl(
 
         draft_block_size = int(draft_model.block_size)
         configured_block_tokens = int(getattr(runtime_config, "draft_block_tokens", 0) or 0)
-        requested_block_tokens = (
-            int(block_tokens)
-            if block_tokens is not None
-            else (configured_block_tokens if configured_block_tokens > 0 else draft_block_size)
-        )
+        if block_tokens is not None:
+            if isinstance(block_tokens, str) and block_tokens.strip().lower() == "auto":
+                requested_block_tokens = _auto_draft_block_tokens(draft_model, draft_block_size)
+            else:
+                requested_block_tokens = int(block_tokens)
+        elif configured_block_tokens < 0:
+            requested_block_tokens = _auto_draft_block_tokens(draft_model, draft_block_size)
+        else:
+            requested_block_tokens = configured_block_tokens if configured_block_tokens > 0 else draft_block_size
         # DFlash draft models are trained/configured with a nominal block size,
         # but the architecture is fully causal and can run longer speculative
         # blocks.  Keep the default at the model's block_size, while honoring an

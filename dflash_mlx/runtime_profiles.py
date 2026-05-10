@@ -10,6 +10,16 @@ from typing import Any, Optional
 
 GiB = 1024 * 1024 * 1024
 RUNTIME_PROFILE_ENV = "DFLASH_RUNTIME_PROFILE"
+AUTO_DRAFT_BLOCK_TOKENS = -1
+
+
+def coerce_draft_block_tokens(value: Any, default: int = 0) -> int:
+    if value is None:
+        return int(default)
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return AUTO_DRAFT_BLOCK_TOKENS
+    return int(value)
+
 
 @dataclass(frozen=True)
 class RuntimeProfile:
@@ -204,7 +214,7 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             "DFLASH_DRAFT_WINDOW_SIZE",
             profile.draft_window_size,
         ),
-        draft_block_tokens=_resolve_int(
+        draft_block_tokens=_resolve_draft_block_tokens(
             getattr(args, "draft_block_tokens", None),
             "DFLASH_DRAFT_BLOCK_TOKENS",
             profile.draft_block_tokens,
@@ -307,8 +317,8 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--draft-sink-size / draft_sink_size must be >= 0")
     if cfg.draft_window_size <= 0:
         raise ValueError("--draft-window-size / draft_window_size must be > 0")
-    if cfg.draft_block_tokens < 0:
-        raise ValueError("--draft-block-tokens / draft_block_tokens must be >= 0")
+    if cfg.draft_block_tokens < AUTO_DRAFT_BLOCK_TOKENS:
+        raise ValueError("--draft-block-tokens / draft_block_tokens must be >= 0 or auto")
     if cfg.verify_len_cap < 0:
         raise ValueError("--verify-len-cap / verify_len_cap must be >= 0")
     if cfg.prefix_cache_max_entries <= 0:
@@ -363,6 +373,15 @@ def _resolve_int(cli_value: Optional[int], env_key: str, default: int) -> int:
     raw = os.environ.get(env_key, "").strip()
     if raw:
         return int(raw)
+    return int(default)
+
+
+def _resolve_draft_block_tokens(cli_value: Any, env_key: str, default: int) -> int:
+    if cli_value is not None:
+        return coerce_draft_block_tokens(cli_value, default)
+    raw = os.environ.get(env_key, "").strip()
+    if raw:
+        return coerce_draft_block_tokens(raw, default)
     return int(default)
 
 def _resolve_float(cli_value: Optional[float], env_key: str, default: float) -> float:

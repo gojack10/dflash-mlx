@@ -93,9 +93,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--draft-block-tokens",
-        type=int,
+        type=str,
         default=None,
-        help="Speculative draft block length; default uses the drafter config.",
+        help="Speculative draft block length; integer, or auto for measured per-drafter defaults.",
     )
     parser.add_argument(
         "--verify-len-cap",
