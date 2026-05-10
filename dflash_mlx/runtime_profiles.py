@@ -27,7 +27,7 @@ class RuntimeProfile:
     prefix_cache_l2_max_bytes: int
     verify_mode: str
     speculative_mode: str = "dflash"
-    ddtree_budget: int = 32
+    ddtree_budget: int = 12
     ddtree_topk: int = 64
     ddtree_dense_mask: bool = False
     generation_snapshot: bool = True
