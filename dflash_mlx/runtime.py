@@ -131,7 +131,8 @@ def apply_repetition_penalty(
         penalized / penalty,
         penalized * penalty,
     )
-    return mx.put_along_axis(logits, idx[None, :], penalized, axis=-1)
+    scatter_idx = idx.reshape((1,) * (logits.ndim - 1) + (-1,))
+    return mx.put_along_axis(logits, scatter_idx, penalized, axis=-1)
 
 def _eval_logits_and_captured(
     logits: mx.array,
