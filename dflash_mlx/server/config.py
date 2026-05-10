@@ -92,6 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Draft context cache rolling window tokens.",
     )
     parser.add_argument(
+        "--draft-block-tokens",
+        type=int,
+        default=None,
+        help="Speculative draft block length; default uses the drafter config.",
+    )
+    parser.add_argument(
         "--verify-len-cap",
         type=int,
         default=None,

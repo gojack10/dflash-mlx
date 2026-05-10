@@ -594,7 +594,12 @@ def stream_dflash_generate_impl(
             _yield_done(_pre_yield)
 
         draft_block_size = int(draft_model.block_size)
-        requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
+        configured_block_tokens = int(getattr(runtime_config, "draft_block_tokens", 0) or 0)
+        requested_block_tokens = (
+            int(block_tokens)
+            if block_tokens is not None
+            else (configured_block_tokens if configured_block_tokens > 0 else draft_block_size)
+        )
         # DFlash draft models are trained/configured with a nominal block size,
         # but the architecture is fully causal and can run longer speculative
         # blocks.  Keep the default at the model's block_size, while honoring an

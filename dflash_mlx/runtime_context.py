@@ -31,6 +31,7 @@ def runtime_config_from_profile(
     prefill_step_size: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
+    draft_block_tokens: int | None = None,
     verify_len_cap: int | None = None,
     prefix_cache: bool | None = None,
     prefix_cache_max_entries: int | None = None,
@@ -70,6 +71,11 @@ def runtime_config_from_profile(
                 runtime_profile.draft_window_size
                 if draft_window_size is None
                 else int(draft_window_size)
+            ),
+            draft_block_tokens=(
+                runtime_profile.draft_block_tokens
+                if draft_block_tokens is None
+                else int(draft_block_tokens)
             ),
             verify_len_cap=(
                 runtime_profile.verify_len_cap

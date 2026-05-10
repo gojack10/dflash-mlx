@@ -17,6 +17,7 @@ class RuntimeProfile:
     prefill_step_size: int
     draft_sink_size: int
     draft_window_size: int
+    draft_block_tokens: int
     verify_len_cap: int
     prefix_cache: bool
     prefix_cache_max_entries: int
@@ -39,6 +40,7 @@ class EffectiveRuntimeConfig:
     prefill_step_size: int
     draft_sink_size: int
     draft_window_size: int
+    draft_block_tokens: int
     verify_len_cap: int
     prefix_cache: bool
     prefix_cache_max_entries: int
@@ -66,6 +68,7 @@ PROFILES: dict[str, RuntimeProfile] = {
         prefill_step_size=4096,
         draft_sink_size=64,
         draft_window_size=1024,
+        draft_block_tokens=0,
         verify_len_cap=0,
         prefix_cache=True,
         prefix_cache_max_entries=4,
@@ -81,6 +84,7 @@ PROFILES: dict[str, RuntimeProfile] = {
         prefill_step_size=8192,
         draft_sink_size=64,
         draft_window_size=1024,
+        draft_block_tokens=0,
         verify_len_cap=0,
         prefix_cache=True,
         prefix_cache_max_entries=4,
@@ -96,6 +100,7 @@ PROFILES: dict[str, RuntimeProfile] = {
         prefill_step_size=1024,
         draft_sink_size=64,
         draft_window_size=1024,
+        draft_block_tokens=0,
         verify_len_cap=0,
         prefix_cache=True,
         prefix_cache_max_entries=2,
@@ -111,6 +116,7 @@ PROFILES: dict[str, RuntimeProfile] = {
         prefill_step_size=4096,
         draft_sink_size=64,
         draft_window_size=1024,
+        draft_block_tokens=0,
         verify_len_cap=0,
         prefix_cache=True,
         prefix_cache_max_entries=8,
@@ -197,6 +203,11 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             getattr(args, "draft_window_size", None),
             "DFLASH_DRAFT_WINDOW_SIZE",
             profile.draft_window_size,
+        ),
+        draft_block_tokens=_resolve_int(
+            getattr(args, "draft_block_tokens", None),
+            "DFLASH_DRAFT_BLOCK_TOKENS",
+            profile.draft_block_tokens,
         ),
         verify_len_cap=_resolve_int(
             getattr(args, "verify_len_cap", None),
@@ -296,6 +307,8 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--draft-sink-size / draft_sink_size must be >= 0")
     if cfg.draft_window_size <= 0:
         raise ValueError("--draft-window-size / draft_window_size must be > 0")
+    if cfg.draft_block_tokens < 0:
+        raise ValueError("--draft-block-tokens / draft_block_tokens must be >= 0")
     if cfg.verify_len_cap < 0:
         raise ValueError("--verify-len-cap / verify_len_cap must be >= 0")
     if cfg.prefix_cache_max_entries <= 0:
