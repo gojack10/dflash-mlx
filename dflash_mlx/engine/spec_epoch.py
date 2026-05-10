@@ -137,18 +137,30 @@ def _commit_ddtree_target_cache(
         if keys is not None and values is not None and hasattr(cache_entry, "offset"):
             offset = int(getattr(cache_entry, "offset", 0) or 0)
             if offset > int(start):
-                selected_keys = mx.take(keys, source_positions, axis=2)
-                selected_values = mx.take(values, source_positions, axis=2)
-                cache_entry.keys[..., int(start):int(target_len), :] = selected_keys
-                cache_entry.values[..., int(start):int(target_len), :] = selected_values
-                cache_entry.offset = int(target_len)
-                # RotatingKVCache tracks both logical offset and physical write
-                # index.  DDTree appends the full DFS tree then keeps only the
-                # accepted path; if _idx remains at start+tree_size, the next
-                # update exposes stale rejected KV slots and mask/key lengths
-                # diverge under target_fa_window.
-                if hasattr(cache_entry, "_idx"):
-                    cache_entry._idx = int(target_len)
+                if hasattr(cache_entry, "max_size") and hasattr(cache_entry, "_idx"):
+                    # RotatingKVCache stores only a physical suffix of the
+                    # logical context.  After tree verification its tensor is:
+                    #   [physical prefix in temporal order][DFS tree nodes]
+                    # so commit by compacting the physical tree suffix, while
+                    # preserving the logical offset for RoPE positions.
+                    tree_size = max(0, int(offset) - int(start))
+                    physical_len = int(keys.shape[2])
+                    physical_prefix = max(0, physical_len - tree_size)
+                    physical_sources = physical_prefix + accepted_dfs
+                    prefix_keys = keys[..., :physical_prefix, :]
+                    prefix_values = values[..., :physical_prefix, :]
+                    selected_keys = mx.take(keys, physical_sources, axis=2)
+                    selected_values = mx.take(values, physical_sources, axis=2)
+                    cache_entry.keys = mx.concatenate([prefix_keys, selected_keys], axis=2)
+                    cache_entry.values = mx.concatenate([prefix_values, selected_values], axis=2)
+                    cache_entry.offset = int(target_len)
+                    cache_entry._idx = int(cache_entry.keys.shape[2])
+                else:
+                    selected_keys = mx.take(keys, source_positions, axis=2)
+                    selected_values = mx.take(values, source_positions, axis=2)
+                    cache_entry.keys[..., int(start):int(target_len), :] = selected_keys
+                    cache_entry.values[..., int(start):int(target_len), :] = selected_values
+                    cache_entry.offset = int(target_len)
             continue
 
         if hasattr(cache_entry, "trim"):
