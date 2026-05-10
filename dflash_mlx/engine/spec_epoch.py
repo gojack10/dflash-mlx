@@ -723,6 +723,8 @@ def stream_dflash_generate_impl(
                             mask_token_tail=mask_token_tail,
                             suppress_token_mask=suppress_token_mask,
                             async_launch=True,
+                            previous_token_ids=_sampled_ids,
+                            repetition_penalty=rep_penalty,
                         )
                         draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
                     prefetched_draft = None
@@ -1018,6 +1020,8 @@ def stream_dflash_generate_impl(
                         mask_token_tail=mask_token_tail,
                         suppress_token_mask=suppress_token_mask,
                         async_launch=True,
+                        previous_token_ids=_sampled_ids,
+                        repetition_penalty=rep_penalty,
                     )
                     launch_ns = time.perf_counter_ns() - draft_start_ns
                     draft_ns_total += launch_ns

@@ -50,6 +50,8 @@ class EagerDraftBackend:
         mask_token_tail: mx.array,
         suppress_token_mask: Optional[mx.array],
         async_launch: bool,
+        previous_token_ids: Optional[list[int]] = None,
+        repetition_penalty: float = 1.0,
     ) -> mx.array:
         if int(block_len) <= 1:
             raise ValueError("draft_greedy requires block_len > 1")
@@ -68,8 +70,13 @@ class EagerDraftBackend:
         draft_logits = target_ops.logits_from_hidden(target_model, draft_hidden[:, 1:, :])
         from dflash_mlx import runtime as runtime_mod
 
+        draft_logits_squeezed = draft_logits
+        if repetition_penalty != 1.0 and previous_token_ids:
+            draft_logits_squeezed = runtime_mod.apply_repetition_penalty(
+                draft_logits_squeezed, previous_token_ids, repetition_penalty
+            )
         drafted = runtime_mod.greedy_tokens_with_mask(
-            draft_logits,
+            draft_logits_squeezed,
             suppress_token_mask,
         ).squeeze(0)
         if async_launch:
