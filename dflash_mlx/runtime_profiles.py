@@ -355,10 +355,6 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--bench-log-dir / bench_log_dir must not be empty")
     if not cfg.prefix_cache and cfg.prefix_cache_l2:
         return replace(cfg, prefix_cache_l2=False)
-    if cfg.target_fa_window > 0 and cfg.prefix_cache:
-        return replace(cfg, prefix_cache=False, prefix_cache_l2=False)
-    if cfg.target_fa_window > 0 and cfg.prefix_cache_l2:
-        return replace(cfg, prefix_cache_l2=False)
     return cfg
 
 def _resolve_profile_name(cli_value: Optional[str]) -> str:

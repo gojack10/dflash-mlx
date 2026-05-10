@@ -204,7 +204,7 @@ def test_capabilities_for_distinguishes_hybrid_and_pure_attention():
     assert pure.supports_recurrent_rollback is False
     assert pure.supports_dflash is True
     assert pure.supports_kv_trim is True
-    assert pure.supports_rotating_cache_snapshot is False
+    assert pure.supports_rotating_cache_snapshot is True
     assert pure.supports_shared_kv is False
 
 def test_gemma4_capabilities_disable_prefix_snapshot_initially():

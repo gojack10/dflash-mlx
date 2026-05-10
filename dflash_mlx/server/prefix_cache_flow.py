@@ -47,6 +47,7 @@ def _prefix_cache_config_key(runtime_context: Any) -> tuple[Any, ...]:
         int(runtime_config.prefix_cache_max_entries),
         int(runtime_config.prefix_cache_max_bytes),
         int(runtime_config.max_snapshot_tokens),
+        int(getattr(runtime_config, "target_fa_window", 0) or 0),
         bool(runtime_config.prefix_cache_l2),
         str(runtime_config.prefix_cache_l2_dir),
         int(runtime_config.prefix_cache_l2_max_bytes),
@@ -65,8 +66,6 @@ def get_dflash_prefix_cache(runtime_context: Optional[Any] = None) -> Optional[D
     if runtime_context is None:
         return None
     runtime_config = runtime_context.runtime
-    if runtime_config.target_fa_window > 0:
-        return None
     if not runtime_config.prefix_cache:
         return None
     config_key = _prefix_cache_config_key(runtime_context)

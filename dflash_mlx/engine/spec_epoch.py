@@ -258,7 +258,7 @@ def stream_dflash_generate_impl(
     snap_prefix_len = _validate_prefix_snapshot(prefix_snapshot, prompt_tokens)
     if not supports_prefix_snapshot:
         snap_prefix_len = 0
-    if snap_prefix_len > 0 and (quantize_kv_cache or target_fa_window > 0):
+    if snap_prefix_len > 0 and quantize_kv_cache:
         snap_prefix_len = 0
     if snap_prefix_len > 0:
         template_cache = target_ops.make_cache(

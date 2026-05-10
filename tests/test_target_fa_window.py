@@ -11,7 +11,7 @@ import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 
-from dflash_mlx.cache.codecs import target_cache_is_serializable
+from dflash_mlx.cache.codecs import build_snapshot, hydrate_target_cache, target_cache_is_serializable
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
@@ -54,6 +54,12 @@ def _runtime_context(*, target_fa_window: int = 0, prefix_cache: bool = True):
         runtime=SimpleNamespace(
             target_fa_window=target_fa_window,
             prefix_cache=prefix_cache,
+            prefix_cache_max_entries=4,
+            prefix_cache_max_bytes=8 * 1024 * 1024 * 1024,
+            max_snapshot_tokens=24000,
+            prefix_cache_l2=False,
+            prefix_cache_l2_dir="",
+            prefix_cache_l2_max_bytes=0,
         ),
         diagnostics=SimpleNamespace(trace=None),
     )
@@ -121,7 +127,7 @@ def test_target_cache_window_rotates_fa_only_and_leaves_gdn_unchanged(monkeypatc
     assert isinstance(caches[1], RecurrentRollbackCache)
     assert isinstance(caches[2], RotatingKVCache)
     assert caches[2].max_size == 2048
-    assert target_cache_is_serializable(caches) is False
+    assert target_cache_is_serializable(caches) is True
 
 def test_target_cache_window_rejects_quantized_target_kv(monkeypatch):
     with pytest.raises(ValueError, match="target_fa_window"):
@@ -151,6 +157,41 @@ def test_target_cache_quantized_kv_is_not_prefix_serializable(monkeypatch):
     assert isinstance(caches[2], QuantizedKVCache)
     assert target_cache_is_serializable(caches) is False
 
+def test_rotating_kv_prefix_snapshot_round_trips_temporal_window():
+    cache = RotatingKVCache(max_size=8)
+    cache.update_and_fetch(_keys(12), _keys(12, offset=1000))
+    cache.update_and_fetch(_keys(4, offset=100), _keys(4, offset=1100))
+    mx.eval(cache.keys, cache.values)
+
+    gdn = RecurrentRollbackCache(size=2)
+    gdn.cache = [mx.ones((1, 3, 4)), mx.ones((1, 2, 4, 4))]
+    target_hidden = mx.zeros((1, 16, 2), dtype=mx.float32)
+    snap = build_snapshot(
+        token_ids=list(range(16)),
+        target_cache=[cache, gdn],
+        target_hidden=target_hidden,
+        last_logits=None,
+        key=_make_prefix_key(8),
+    )
+
+    hydrated = hydrate_target_cache(
+        snap,
+        [RotatingKVCache(max_size=8), RecurrentRollbackCache(size=2)],
+    )
+
+    restored = hydrated[0]
+    assert isinstance(restored, RotatingKVCache)
+    assert restored.offset == 16
+    assert restored._idx == restored.keys.shape[2]
+    assert restored.keys.shape[2] <= 11
+    assert restored.make_mask(4, return_array=True).shape[-2:] == (4, 11)
+
+    restored.update_and_fetch(_keys(4, offset=200), _keys(4, offset=1200))
+    mx.eval(restored.keys, restored.values)
+    assert restored.offset == 20
+    assert restored.keys.shape[2] == 11
+
+
 def test_prefix_cache_fingerprint_separates_target_fa_window():
     prompt = [1, 2, 3, 4]
     key_full = _make_prefix_key(0)
@@ -174,7 +215,7 @@ def test_prefix_cache_fingerprint_separates_target_fa_window():
     assert matched == 0
     assert found is None
 
-def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
+def test_prefix_cache_flow_enabled_for_windowed_target(monkeypatch):
     import dflash_mlx.server.prefix_cache_flow as flow_mod
 
     class FakeProvider:
@@ -199,8 +240,9 @@ def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
         runtime_context=_runtime_context(target_fa_window=2048),
     )
 
-    assert flow.cache is None
-    assert flow.key is None
+    assert flow.cache is not None
+    assert flow.key is not None
+    assert flow.key.target_fa_window == 2048
     assert flow.hit_tokens == 0
     assert flow.snapshot is None
 

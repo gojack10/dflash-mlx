@@ -268,19 +268,6 @@ def _check_scripts_importable() -> DoctorCheck:
 
 def _config_warnings(cfg: EffectiveRuntimeConfig) -> list[DoctorCheck]:
     checks: list[DoctorCheck] = []
-    if cfg.target_fa_window > 0:
-        checks.append(
-            DoctorCheck(
-                "target_fa_window",
-                "warning",
-                "target FA window disables prefix-cache and L2 snapshots",
-                {
-                    "target_fa_window": cfg.target_fa_window,
-                    "prefix_cache": cfg.prefix_cache,
-                    "prefix_cache_l2": cfg.prefix_cache_l2,
-                },
-            )
-        )
     return checks
 
 def _check_l2_config(cfg: EffectiveRuntimeConfig) -> DoctorCheck:

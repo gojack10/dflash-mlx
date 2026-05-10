@@ -426,7 +426,7 @@ class QwenGdnTargetOps:
             supports_recurrent_rollback=has_recurrent,
             supports_kv_trim=True,
             supports_prefix_snapshot=True,
-            supports_rotating_cache_snapshot=False,
+            supports_rotating_cache_snapshot=True,
             supports_shared_kv=False,
             supports_target_hidden_capture=True,
         )

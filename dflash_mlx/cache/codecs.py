@@ -77,7 +77,7 @@ def target_cache_is_serializable(target_cache: list[Any]) -> bool:
         if isinstance(entry, RecurrentRollbackCache):
             continue
         if isinstance(entry, RotatingKVCache):
-            return False
+            continue
         if isinstance(entry, KVCache):
             continue
         return False
@@ -95,6 +95,21 @@ def serialize_target_cache(
         if isinstance(entry, RecurrentRollbackCache):
             fa.append(None)
             gdn.append(tuple(_clone_array(a) for a in entry.cache))
+        elif isinstance(entry, RotatingKVCache):
+            keys = getattr(entry, "keys", None)
+            values = getattr(entry, "values", None)
+            if keys is None or values is None:
+                fa.append(None)
+                gdn.append(None)
+            else:
+                # Store physical KV in temporal order, but keep the logical
+                # offset. Hydration recreates a RotatingKVCache with the same
+                # logical position so RoPE/masks remain correct while only the
+                # bounded window is retained.
+                k = entry._temporal_order(keys)
+                v = entry._temporal_order(values)
+                fa.append((_clone_array(k), _clone_array(v), int(entry.offset)))
+                gdn.append(None)
         elif isinstance(entry, KVCache):
             state = entry.state
             if state is None or state[0] is None:
@@ -134,6 +149,16 @@ def hydrate_target_cache(
                 conv_kernel_size=tmpl.conv_kernel_size,
             )
             new_cache.cache = [_clone_array(a) for a in gdn_state]
+            result.append(new_cache)
+        elif isinstance(tmpl, RotatingKVCache):
+            if fa_state is None:
+                raise ValueError(f"Snapshot missing FA state at layer {i}")
+            k, v, offset = fa_state
+            new_cache = RotatingKVCache(max_size=tmpl.max_size, keep=tmpl.keep)
+            new_cache.keys = _clone_array(k)
+            new_cache.values = _clone_array(v)
+            new_cache.offset = int(offset)
+            new_cache._idx = int(new_cache.keys.shape[2]) if new_cache.keys is not None else 0
             result.append(new_cache)
         elif isinstance(tmpl, KVCache):
             if fa_state is None:

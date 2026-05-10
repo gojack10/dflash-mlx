@@ -565,13 +565,12 @@ def test_profile_validation_errors(argv, error):
     with pytest.raises(SystemExit, match=error):
         normalize_cli_args(args)
 
-def test_target_fa_window_disables_prefix_cache(monkeypatch):
+def test_target_fa_window_keeps_prefix_cache(monkeypatch):
     _clear_profile_env(monkeypatch)
     args = build_parser().parse_args(["--model", "m", "--target-fa-window", "2048"])
     normalize_cli_args(args)
     assert args.runtime_config.target_fa_window == 2048
-    assert args.runtime_config.prefix_cache is False
-    assert args.runtime_config.prefix_cache_l2 is False
+    assert args.runtime_config.prefix_cache is True
 
 def test_prefix_cache_disabled_disables_l2(monkeypatch):
     _clear_profile_env(monkeypatch)

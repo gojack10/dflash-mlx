@@ -308,15 +308,6 @@ def normalize_cli_args(args: argparse.Namespace) -> argparse.Namespace:
         runtime_config = resolve_runtime_config(args)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    if runtime_config.target_fa_window > 0 and (
-        args.prefix_cache is not False
-        or args.prefix_cache_l2 is True
-        or runtime_config.profile == "long-session"
-    ):
-        sys.stderr.write(
-            "[dflash] warning: target FA window disables prefix cache and L2 snapshots\n"
-        )
-        sys.stderr.flush()
     if diagnostics_dir is not None:
         _write_diagnostics_bootstrap(args, runtime_config, diagnostics_dir)
     diagnostics_config = _build_diagnostics_config(args, runtime_config, diagnostics_dir)
