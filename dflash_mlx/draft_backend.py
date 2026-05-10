@@ -181,8 +181,14 @@ class EagerDraftBackend:
         sort_order = mx.argsort(-top_logits, axis=-1)
         top_token_ids = mx.take_along_axis(top_indices, sort_order, axis=-1).astype(mx.uint32)
         top_logits = mx.take_along_axis(top_logits, sort_order, axis=-1)
-        top_log_probs = (top_logits - mx.logsumexp(dlogits, axis=-1, keepdims=True)).astype(mx.float32)
-        return greedy, top_token_ids.squeeze(0), top_log_probs.squeeze(0)
+        # DDTree only needs proposal scores to rank draft branches; target
+        # verification remains exact.  A full-vocab logsumexp here adds a
+        # second expensive reduction over the 248k Qwen vocabulary every draft
+        # cycle.  Center scores on the local best top-k logit instead: this
+        # preserves within-position ordering and gap information while avoiding
+        # the full softmax normalization.
+        top_scores = (top_logits - top_logits[:, :, :1]).astype(mx.float32)
+        return greedy, top_token_ids.squeeze(0), top_scores.squeeze(0)
 
 
 def make_draft_backend() -> EagerDraftBackend:
