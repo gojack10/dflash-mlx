@@ -194,15 +194,23 @@ def stream_dflash_generate_impl(
     stable_prefix_len: Optional[int] = None,
     prefix_cache: Optional[Any] = None,
     runtime_context: Any,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
 ) -> Iterator[dict[str, Any]]:
     from dflash_mlx.runtime import (
         _eval_logits_and_captured,
         _ns_to_us,
         _prepare_prompt_tokens,
         apply_repetition_penalty,
+        batched_sample_from_probs,
         build_suppress_token_mask,
+        compute_target_probs,
         greedy_tokens_with_mask,
+        sample_with_temperature,
+        stochastic_linear_walk,
+        stochastic_tree_walk,
     )
+    stochastic_decode = float(temperature) > 0.0
     target_ops = resolve_target_ops(target_model)
     bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
 
@@ -575,10 +583,21 @@ def stream_dflash_generate_impl(
         suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
         rep_penalty = float(getattr(runtime_config, "repetition_penalty", 1.0) or 1.0)
         _sampled_ids: list[int] = list(prompt_tokens)  # seed with full prompt for conversation-level penalty
-        staged_first = greedy_tokens_with_mask(
-            apply_repetition_penalty(prefill_logits[:, -1:, :], _sampled_ids, rep_penalty).squeeze(0),
-            suppress_token_mask,
-        ).reshape(-1)
+        if stochastic_decode:
+            _first_tok = sample_with_temperature(
+                prefill_logits[:, -1:, :].reshape(-1),
+                temperature=temperature,
+                top_p=top_p,
+                suppress_token_mask=suppress_token_mask,
+                generated_token_ids=_sampled_ids,
+                rep_penalty=rep_penalty,
+            )
+            staged_first = mx.array([_first_tok], dtype=mx.uint32)
+        else:
+            staged_first = greedy_tokens_with_mask(
+                apply_repetition_penalty(prefill_logits[:, -1:, :], _sampled_ids, rep_penalty).squeeze(0),
+                suppress_token_mask,
+            ).reshape(-1)
         prefill_tokens_restored = max(0, min(int(snap_prefix_len), int(prompt_len)))
         prefill_tokens_computed = max(0, int(prompt_len) - prefill_tokens_restored)
 
@@ -902,16 +921,37 @@ def stream_dflash_generate_impl(
                 # diagnostics/full is off; request logs expose that cost as
                 # ddtree_timing_avg_us.posterior_argmax.
                 _posterior_start_ns = time.perf_counter_ns()
-                posterior_tokens = greedy_tokens_with_mask(
-                    apply_repetition_penalty(tree_logits[0], _sampled_ids, rep_penalty),
-                    suppress_token_mask,
-                )
-                posterior_list = posterior_tokens.tolist()
+                if stochastic_decode:
+                    # Direct-sample from target distribution at every tree node, then walk
+                    # the tree following sampled tokens. Provably preserves target marginal
+                    # at each emitted position (sampled ~ p(node) directly).
+                    target_probs_tree = compute_target_probs(
+                        tree_logits[0],
+                        temperature=temperature,
+                        top_p=top_p,
+                        suppress_token_mask=suppress_token_mask,
+                        generated_token_ids=_sampled_ids,
+                        rep_penalty=rep_penalty,
+                    )
+                    sampled_per_node_arr = batched_sample_from_probs(target_probs_tree)
+                    sampled_per_node = sampled_per_node_arr.tolist()
+                    posterior_list = sampled_per_node  # bonus / next-staged uses same source
+                else:
+                    posterior_tokens = greedy_tokens_with_mask(
+                        apply_repetition_penalty(tree_logits[0], _sampled_ids, rep_penalty),
+                        suppress_token_mask,
+                    )
+                    posterior_list = posterior_tokens.tolist()
                 ddtree_posterior_ns = time.perf_counter_ns() - _posterior_start_ns
                 _walk_start_ns = time.perf_counter_ns()
-                accepted_indices, bonus_token = _follow_verified_tree(
-                    tree.child_maps, posterior_list
-                )
+                if stochastic_decode:
+                    accepted_indices, bonus_token = stochastic_tree_walk(
+                        tree.child_maps, posterior_list
+                    )
+                else:
+                    accepted_indices, bonus_token = _follow_verified_tree(
+                        tree.child_maps, posterior_list
+                    )
                 ddtree_walk_ns = time.perf_counter_ns() - _walk_start_ns
                 acceptance_len = len(accepted_indices) - 1  # minus root
                 acceptance_history.append(acceptance_len)
@@ -1028,15 +1068,35 @@ def stream_dflash_generate_impl(
 
             if not _ddtree_cycle:
                 acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
-                posterior = greedy_tokens_with_mask(
-                    apply_repetition_penalty(verify_logits[0], _sampled_ids, rep_penalty),
-                    suppress_token_mask,
-                )
-                if not profile_cycles:
-                    mx.async_eval(posterior)
-                acceptance_len = int(
-                    _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
-                )
+                if stochastic_decode:
+                    target_probs_linear = compute_target_probs(
+                        verify_logits[0],
+                        temperature=temperature,
+                        top_p=top_p,
+                        suppress_token_mask=suppress_token_mask,
+                        generated_token_ids=_sampled_ids,
+                        rep_penalty=rep_penalty,
+                    )
+                    sampled_per_pos_arr = batched_sample_from_probs(target_probs_linear)
+                    sampled_per_pos = sampled_per_pos_arr.tolist()
+                    posterior = sampled_per_pos_arr  # used downstream for staged_first_next slice
+                    draft_token_ids_list = verify_token_ids[1:].tolist()
+                    acceptance_len, linear_bonus = stochastic_linear_walk(
+                        sampled_per_pos, draft_token_ids_list
+                    )
+                    # staged_first_next slot needs to be derivable from posterior[acceptance_len:acceptance_len+1].
+                    # sampled_per_pos already has the bonus at index acceptance_len, so existing
+                    # `posterior[acceptance_len:acceptance_len+1]` works unchanged.
+                else:
+                    posterior = greedy_tokens_with_mask(
+                        apply_repetition_penalty(verify_logits[0], _sampled_ids, rep_penalty),
+                        suppress_token_mask,
+                    )
+                    if not profile_cycles:
+                        mx.async_eval(posterior)
+                    acceptance_len = int(
+                        _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
+                    )
                 acceptance_history.append(acceptance_len)
                 if profile_cycles:
                     acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns

@@ -134,6 +134,175 @@ def apply_repetition_penalty(
     scatter_idx = idx.reshape((1,) * (logits.ndim - 1) + (-1,))
     return mx.put_along_axis(logits, scatter_idx, penalized, axis=-1)
 
+def compute_target_probs(
+    logits: mx.array,
+    *,
+    temperature: float,
+    top_p: float = 1.0,
+    suppress_token_mask: Optional[mx.array] = None,
+    generated_token_ids: Optional[list[int]] = None,
+    rep_penalty: float = 1.0,
+) -> mx.array:
+    """Compute target probability distribution at temperature T, with top-p truncation.
+
+    Applies (in order): repetition penalty → suppress mask → divide by T → softmax →
+    top-p truncation → renormalize. Output sums to 1 along the last axis.
+
+    Args:
+        logits: shape [..., vocab].
+        temperature: > 0.
+        top_p: in (0, 1]. 1.0 means no truncation.
+        suppress_token_mask: optional [vocab] bool, True = suppress.
+        generated_token_ids: history for repetition penalty.
+        rep_penalty: 1.0 means no penalty.
+    """
+    if rep_penalty != 1.0 and generated_token_ids:
+        logits = apply_repetition_penalty(logits, generated_token_ids, rep_penalty)
+    if suppress_token_mask is not None:
+        floor = mx.array(-1e9, dtype=logits.dtype)
+        logits = mx.where(suppress_token_mask, floor, logits)
+    scaled = logits / float(temperature)
+    probs = mx.softmax(scaled, axis=-1)
+    if top_p < 1.0:
+        probs = _apply_top_p(probs, top_p)
+    return probs
+
+
+def _apply_top_p(probs: mx.array, top_p: float) -> mx.array:
+    """Top-p (nucleus) truncation: keep smallest set of tokens whose mass ≥ top_p, renormalize."""
+    # Sort descending along last axis, find cutoff
+    sort_idx = mx.argsort(-probs, axis=-1)
+    sorted_probs = mx.take_along_axis(probs, sort_idx, axis=-1)
+    cumsum = mx.cumsum(sorted_probs, axis=-1)
+    # Keep tokens where cumsum (before adding this token) < top_p.
+    # Equivalent: keep if (cumsum - sorted_probs) < top_p.
+    keep_sorted = (cumsum - sorted_probs) < float(top_p)
+    # Scatter the keep mask back to original positions.
+    keep = mx.zeros(probs.shape, dtype=mx.bool_)
+    keep = mx.put_along_axis(keep, sort_idx, keep_sorted, axis=-1)
+    truncated = mx.where(keep, probs, mx.zeros(probs.shape, dtype=probs.dtype))
+    # Renormalize
+    norm = mx.sum(truncated, axis=-1, keepdims=True)
+    # If norm is zero (shouldn't happen because top-1 is always kept), fall back to original.
+    safe_norm = mx.where(norm > 0, norm, mx.ones_like(norm))
+    return truncated / safe_norm
+
+
+def sample_with_temperature(
+    logits: mx.array,
+    *,
+    temperature: float,
+    top_p: float = 1.0,
+    suppress_token_mask: Optional[mx.array] = None,
+    generated_token_ids: Optional[list[int]] = None,
+    rep_penalty: float = 1.0,
+) -> int:
+    """Sample a single token from a single logit row using temp + top_p.
+
+    Args:
+        logits: shape [vocab] (1D).
+    Returns:
+        Sampled token id (int).
+    """
+    if logits.ndim != 1:
+        logits = logits.reshape(-1)
+    probs = compute_target_probs(
+        logits,
+        temperature=temperature,
+        top_p=top_p,
+        suppress_token_mask=suppress_token_mask,
+        generated_token_ids=generated_token_ids,
+        rep_penalty=rep_penalty,
+    )
+    log_probs = mx.log(probs + 1e-30)
+    sampled = mx.random.categorical(log_probs[None, :])
+    return int(sampled.item())
+
+
+def _sample_categorical(p_row: mx.array) -> int:
+    """Sample one token from a probability row [vocab] using mx.random.categorical.
+
+    Falls back to argmax if probability sums to ~0 (pathological case).
+    """
+    total = float(mx.sum(p_row).item())
+    if total < 1e-20:
+        return int(mx.argmax(p_row).item())
+    log_probs = mx.log(p_row + 1e-30)
+    sampled = mx.random.categorical(log_probs[None, :])
+    return int(sampled.item())
+
+
+def stochastic_tree_walk(
+    child_maps: list[dict],
+    sampled_per_node: list[int],
+) -> tuple[list[int], int]:
+    """Walk a draft tree following tokens sampled from the target distribution.
+
+    Each emitted token is drawn directly from the target softmax at the
+    appropriate tree position; the walk descends a child whenever the sample
+    matches a draft proposal, otherwise the sample becomes the bonus token and
+    the walk terminates. Because every emitted token comes from p(·) at the
+    correct position, the resulting sequence is distributed exactly as the
+    target — this is the standard speculative-sampling formulation used by
+    production engines (Medusa / EAGLE-2 / Specinfer fallback path).
+
+    Args:
+        child_maps: per-node dict {token_id: child_node_index}.
+        sampled_per_node: pre-sampled target token at each tree node (one int per
+            node, drawn from target_probs[node]). Caller pre-samples on GPU in
+            one batch and passes the resulting list to avoid per-node sync.
+
+    Returns:
+        (accepted_indices, bonus_token_id) — accepted_indices always starts with [0].
+    """
+    accepted: list[int] = [0]
+    current = 0
+    while child_maps[current]:
+        sampled_tok = int(sampled_per_node[current])
+        if sampled_tok in child_maps[current]:
+            current = child_maps[current][sampled_tok]
+            accepted.append(current)
+        else:
+            return accepted, sampled_tok
+    # Reached a leaf node.
+    return accepted, int(sampled_per_node[current])
+
+
+def stochastic_linear_walk(
+    sampled_per_pos: list[int],
+    draft_token_ids: list[int],
+) -> tuple[int, int]:
+    """Linear analogue of stochastic_tree_walk: accept while target sample matches draft.
+
+    Args:
+        sampled_per_pos: target samples at each position (length = block_len).
+        draft_token_ids: draft's chosen tokens (length = block_len - 1 typically;
+            matches existing acceptance semantics where position k's draft is
+            compared to position k's target).
+    Returns:
+        (acceptance_length, bonus_token_id).
+    """
+    n_compare = min(len(sampled_per_pos), len(draft_token_ids))
+    for i in range(n_compare):
+        if int(sampled_per_pos[i]) != int(draft_token_ids[i]):
+            return i, int(sampled_per_pos[i])
+    bonus_idx = min(n_compare, len(sampled_per_pos) - 1)
+    return n_compare, int(sampled_per_pos[bonus_idx])
+
+
+def batched_sample_from_probs(target_probs: mx.array) -> mx.array:
+    """Sample one token per row of a probability tensor in a single GPU call.
+
+    Args:
+        target_probs: [N, vocab] probabilities (each row sums to 1).
+    Returns:
+        [N] sampled token ids as mx.uint32.
+    """
+    # mx.random.categorical takes logits. log(p + eps) keeps numerical stability.
+    log_probs = mx.log(target_probs + 1e-30)
+    return mx.random.categorical(log_probs, axis=-1).astype(mx.uint32)
+
+
 def _eval_logits_and_captured(
     logits: mx.array,
     captured: list[mx.array] | dict[int, mx.array],
