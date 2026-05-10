@@ -121,6 +121,13 @@ def _commit_ddtree_target_cache(
                 cache_entry.keys[..., int(start):int(target_len), :] = selected_keys
                 cache_entry.values[..., int(start):int(target_len), :] = selected_values
                 cache_entry.offset = int(target_len)
+                # RotatingKVCache tracks both logical offset and physical write
+                # index.  DDTree appends the full DFS tree then keeps only the
+                # accepted path; if _idx remains at start+tree_size, the next
+                # update exposes stale rejected KV slots and mask/key lengths
+                # diverge under target_fa_window.
+                if hasattr(cache_entry, "_idx"):
+                    cache_entry._idx = int(target_len)
             continue
 
         if hasattr(cache_entry, "trim"):
@@ -534,7 +541,7 @@ def stream_dflash_generate_impl(
 
         suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
         rep_penalty = float(getattr(runtime_config, "repetition_penalty", 1.0) or 1.0)
-        _sampled_ids: list[int] = []  # track generated tokens for repetition penalty
+        _sampled_ids: list[int] = list(prompt_tokens)  # seed with full prompt for conversation-level penalty
         staged_first = greedy_tokens_with_mask(
             apply_repetition_penalty(prefill_logits[:, -1:, :], _sampled_ids, rep_penalty).squeeze(0),
             suppress_token_mask,
@@ -565,6 +572,13 @@ def stream_dflash_generate_impl(
         _pre_yield = _yield_start()
         yield prefill_event
         _yield_done(_pre_yield)
+
+        # Decode/read-speed accounting starts once prefill is complete and the
+        # prefill event has been handed to the caller.  Keep both wall time and
+        # core time (wall minus generator yield/backpressure) so request logs
+        # can separate model decode from SSE/client pacing.
+        decode_start_ns = time.perf_counter_ns()
+        decode_yield_pause_start_ns = _yield_pause_ns
 
         first_token_yielded = False
         if max_new_tokens > 0:
@@ -636,11 +650,45 @@ def stream_dflash_generate_impl(
             "cache_commit": 0,
             "next_draft_launch": 0,
         }
+        # Low-overhead DDTree timing counters are always collected.  Unlike
+        # diagnostics/full they do not add per-layer synchronization; they use
+        # sync points already required by DDTree (top-k CPU transfer, target
+        # verify, cache commit) so production request logs can explain where
+        # the missing speedup went.
+        ddtree_timing_totals_ns = {
+            "draft_launch": 0,
+            "tree_build": 0,
+            "topk_cast": 0,
+            "topk_sync": 0,
+            "topk_transfer": 0,
+            "heap_build": 0,
+            "compile": 0,
+            "target_verify": 0,
+            "posterior_argmax": 0,
+            "tree_walk": 0,
+            "accepted_gather": 0,
+            "cache_commit": 0,
+            "next_draft_launch": 0,
+            "cycle_total": 0,
+        }
+        ddtree_cycle_count = 0
+        ddtree_tree_size_total = 0
+        ddtree_node_count_total = 0
+        ddtree_tree_size_max = 0
+        ddtree_acceptance_len_total = 0
+        ddtree_commit_count_total = 0
+        ddtree_prefetch_hits = 0
+        ddtree_prefetch_misses = 0
+        draft_prefetch_hits = 0
+        draft_prefetch_misses = 0
+        token_loop_end_ns = 0
+        token_loop_yield_pause_end_ns = 0
+        cycle_total_ns_total = 0
         prefetched_draft: Optional[dict[str, Any]] = None
 
         while len(generated_token_ids) < max_new_tokens:
             _ddtree_cycle = False
-            cycle_start_ns = time.perf_counter_ns() if profile_cycles else 0
+            cycle_start_ns = time.perf_counter_ns()
             draft_cycle_ns = 0
             verify_cycle_ns = 0
             replay_cycle_ns = 0
@@ -651,6 +699,7 @@ def stream_dflash_generate_impl(
             ddtree_bonus_token_id: int | None = None
             ddtree_committed_ids: list[int] | None = None
             ddtree_compile_ns = 0
+            ddtree_tree_profile: dict[str, Any] = {}
             ddtree_verify_profile: dict[str, Any] = {}
             ddtree_posterior_ns = 0
             ddtree_walk_ns = 0
@@ -680,12 +729,14 @@ def stream_dflash_generate_impl(
                         and int(prefetched_draft["block_len"]) == block_len
                         and int(prefetched_draft.get("topk", 0)) == min(ddtree_topk, ddtree_budget)
                     ):
+                        ddtree_prefetch_hits += 1
                         drafted = prefetched_draft["drafted"]
                         draft_tree_top_ids = prefetched_draft["top_ids"]
                         draft_tree_top_log_probs = prefetched_draft["top_log_probs"]
                         current_staged_first = prefetched_draft["staged_first"]
                         prefetched_draft = None
                     else:
+                        ddtree_prefetch_misses += 1
                         draft_start_ns = time.perf_counter_ns()
                         drafted, draft_tree_top_ids, draft_tree_top_log_probs = draft_backend.draft_topk(
                             target_model=target_model,
@@ -709,9 +760,11 @@ def stream_dflash_generate_impl(
                         prefetched_draft is not None
                         and int(prefetched_draft["block_len"]) == block_len
                     ):
+                        draft_prefetch_hits += 1
                         drafted = prefetched_draft["drafted"]
                         current_staged_first = prefetched_draft["staged_first"]
                     else:
+                        draft_prefetch_misses += 1
                         draft_start_ns = time.perf_counter_ns()
                         drafted = draft_backend.draft_greedy(
                             target_model=target_model,
@@ -747,10 +800,12 @@ def stream_dflash_generate_impl(
                 )
 
                 _tree_build_start_ns = time.perf_counter_ns()
+                ddtree_tree_profile: dict[str, Any] = {}
                 tree = build_ddtree_tree_from_mlx_topk(
                     draft_tree_top_ids,
                     draft_tree_top_log_probs,
                     budget=ddtree_budget,
+                    profile=ddtree_tree_profile,
                 )
                 mx.eval()  # sync: tree build complete, CPU data ready
                 ddtree_tree_build_ns = time.perf_counter_ns() - _tree_build_start_ns
@@ -795,7 +850,9 @@ def stream_dflash_generate_impl(
                     )
                     sys.stderr.flush()
 
-                # Walk tree
+                # Walk tree. This includes the lazy full-tree LM head when
+                # diagnostics/full is off; request logs expose that cost as
+                # ddtree_timing_avg_us.posterior_argmax.
                 _posterior_start_ns = time.perf_counter_ns()
                 posterior_tokens = greedy_tokens_with_mask(
                     apply_repetition_penalty(tree_logits[0], _sampled_ids, rep_penalty),
@@ -1106,13 +1163,35 @@ def stream_dflash_generate_impl(
                             )
                         ).item()
                     )
-            if stop_hit:
-                break
-
             staged_first = staged_first_next
 
+            cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
+            cycle_total_ns_total += cycle_total_ns
+            if _ddtree_cycle:
+                ddtree_cycle_count += 1
+                _tree_size = int(getattr(tree, "tree_size", 0))
+                _node_count = int(getattr(tree, "node_count", 0))
+                ddtree_tree_size_total += _tree_size
+                ddtree_node_count_total += _node_count
+                ddtree_tree_size_max = max(ddtree_tree_size_max, _tree_size)
+                ddtree_acceptance_len_total += int(acceptance_len)
+                ddtree_commit_count_total += int(commit_count)
+                ddtree_timing_totals_ns["draft_launch"] += draft_cycle_ns
+                ddtree_timing_totals_ns["tree_build"] += ddtree_tree_build_ns
+                ddtree_timing_totals_ns["topk_cast"] += int(ddtree_tree_profile.get("topk_cast_ns", 0))
+                ddtree_timing_totals_ns["topk_sync"] += int(ddtree_tree_profile.get("topk_sync_ns", 0))
+                ddtree_timing_totals_ns["topk_transfer"] += int(ddtree_tree_profile.get("topk_transfer_ns", 0))
+                ddtree_timing_totals_ns["heap_build"] += int(ddtree_tree_profile.get("heap_build_ns", 0))
+                ddtree_timing_totals_ns["compile"] += ddtree_compile_ns
+                ddtree_timing_totals_ns["target_verify"] += verify_cycle_ns
+                ddtree_timing_totals_ns["posterior_argmax"] += ddtree_posterior_ns
+                ddtree_timing_totals_ns["tree_walk"] += ddtree_walk_ns
+                ddtree_timing_totals_ns["accepted_gather"] += ddtree_gather_ns
+                ddtree_timing_totals_ns["cache_commit"] += ddtree_cache_commit_ns
+                ddtree_timing_totals_ns["next_draft_launch"] += ddtree_next_draft_launch_ns
+                ddtree_timing_totals_ns["cycle_total"] += cycle_total_ns
+
             if profile_cycles:
-                cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
                 ddtree_named_ns = (
                     ddtree_tree_build_ns
                     + ddtree_compile_ns
@@ -1153,6 +1232,10 @@ def stream_dflash_generate_impl(
                             "ddtree_tree_size": int(getattr(tree, "tree_size", 0)),
                             "ddtree_node_count": int(getattr(tree, "node_count", 0)),
                             "ddtree_tree_build_us": _ns_to_us(ddtree_tree_build_ns),
+                            "ddtree_topk_cast_us": _ns_to_us(int(ddtree_tree_profile.get("topk_cast_ns", 0))),
+                            "ddtree_topk_sync_us": _ns_to_us(int(ddtree_tree_profile.get("topk_sync_ns", 0))),
+                            "ddtree_topk_transfer_us": _ns_to_us(int(ddtree_tree_profile.get("topk_transfer_ns", 0))),
+                            "ddtree_heap_build_us": _ns_to_us(int(ddtree_tree_profile.get("heap_build_ns", 0))),
                             "ddtree_compile_us": _ns_to_us(ddtree_compile_ns),
                             "ddtree_verify_setup_us": _ns_to_us(int(ddtree_verify_profile.get("setup_ns", 0))),
                             "ddtree_verify_fa_layers_us": _ns_to_us(int(ddtree_verify_profile.get("fa_layers_ns", 0))),
@@ -1191,6 +1274,12 @@ def stream_dflash_generate_impl(
                     ddtree_profile_totals_ns["accepted_gather"] += ddtree_gather_ns
                     ddtree_profile_totals_ns["cache_commit"] += ddtree_cache_commit_ns
                     ddtree_profile_totals_ns["next_draft_launch"] += ddtree_next_draft_launch_ns
+
+            if stop_hit:
+                break
+
+        token_loop_end_ns = time.perf_counter_ns()
+        token_loop_yield_pause_end_ns = _yield_pause_ns
 
         if (
             generation_snapshot_enabled
@@ -1244,7 +1333,24 @@ def stream_dflash_generate_impl(
             finally:
                 generation_snapshot_ns += time.perf_counter_ns() - generation_snapshot_start_ns
 
-        elapsed_us = (time.perf_counter_ns() - start_ns - _yield_pause_ns) / 1_000.0
+        summary_end_ns = time.perf_counter_ns()
+        if decode_start_ns <= 0:
+            decode_start_ns = summary_end_ns
+        if token_loop_end_ns <= 0:
+            token_loop_end_ns = summary_end_ns
+            token_loop_yield_pause_end_ns = _yield_pause_ns
+        total_wall_ns = summary_end_ns - start_ns
+        elapsed_us = (total_wall_ns - _yield_pause_ns) / 1_000.0
+        decode_wall_ns = max(0, summary_end_ns - decode_start_ns)
+        decode_yield_pause_ns = max(0, _yield_pause_ns - decode_yield_pause_start_ns)
+        decode_core_ns = max(0, decode_wall_ns - decode_yield_pause_ns)
+        token_loop_wall_ns = max(0, token_loop_end_ns - decode_start_ns)
+        token_loop_yield_pause_ns = max(0, token_loop_yield_pause_end_ns - decode_yield_pause_start_ns)
+        token_loop_core_ns = max(0, token_loop_wall_ns - token_loop_yield_pause_ns)
+
+        def _tps(token_count: int, elapsed_ns: int) -> float:
+            return (float(token_count) / (elapsed_ns / 1_000_000_000.0)) if elapsed_ns > 0 else 0.0
+
         first_20 = acceptance_history[:20]
         last_20 = acceptance_history[-20:]
         summary = {
@@ -1269,7 +1375,23 @@ def stream_dflash_generate_impl(
                 "commit": commit_ns_total / 1_000.0,
                 "generation_snapshot": generation_snapshot_ns / 1_000.0,
                 "yield_pause": _yield_pause_ns / 1_000.0,
+                "decode_yield_pause": decode_yield_pause_ns / 1_000.0,
+                "token_loop_yield_pause": token_loop_yield_pause_ns / 1_000.0,
             },
+            "decode_timings_us": {
+                "post_prefill_wall": decode_wall_ns / 1_000.0,
+                "post_prefill_core": decode_core_ns / 1_000.0,
+                "to_last_token_wall": token_loop_wall_ns / 1_000.0,
+                "to_last_token_core": token_loop_core_ns / 1_000.0,
+                "generation_snapshot": generation_snapshot_ns / 1_000.0,
+            },
+            "post_prefill_wall_tps": _tps(len(generated_token_ids), decode_wall_ns),
+            "post_prefill_core_tps": _tps(len(generated_token_ids), decode_core_ns),
+            "decode_to_last_token_wall_tps": _tps(len(generated_token_ids), token_loop_wall_ns),
+            "decode_to_last_token_core_tps": _tps(len(generated_token_ids), token_loop_core_ns),
+            "cycle_wall_ms": (token_loop_wall_ns / cycles_completed / 1_000_000.0) if cycles_completed > 0 else 0.0,
+            "cycle_core_ms": (token_loop_core_ns / cycles_completed / 1_000_000.0) if cycles_completed > 0 else 0.0,
+            "cycle_measured_avg_ms": (cycle_total_ns_total / cycles_completed / 1_000_000.0) if cycles_completed > 0 else 0.0,
             "verify_len_cap": int(verify_len_cap),
             "quantize_kv_cache": bool(quantize_kv_cache),
             "target_fa_window": int(target_fa_window),
@@ -1277,12 +1399,37 @@ def stream_dflash_generate_impl(
             "draft_window_size": int(draft_window_size),
             "clear_cache_boundaries": bool(clear_cache_boundaries),
             "generation_snapshot": bool(generation_snapshot_enabled),
+            "prefetch": {
+                "draft_hits": int(draft_prefetch_hits),
+                "draft_misses": int(draft_prefetch_misses),
+                "ddtree_hits": int(ddtree_prefetch_hits),
+                "ddtree_misses": int(ddtree_prefetch_misses),
+            },
             "tokens_per_cycle": (len(generated_token_ids) / cycles_completed) if cycles_completed > 0 else 0.0,
             "acceptance_history": list(acceptance_history),
             "acceptance_first_20_avg": (sum(first_20) / len(first_20)) if first_20 else 0.0,
             "acceptance_last_20_avg": (sum(last_20) / len(last_20)) if last_20 else 0.0,
             "peak_memory_gb": float(mx.get_peak_memory()) / 1e9 if hasattr(mx, "get_peak_memory") else None,
         }
+        if ddtree_cycle_count > 0:
+            summary["ddtree"] = {
+                "cycles": int(ddtree_cycle_count),
+                "avg_tree_size": ddtree_tree_size_total / ddtree_cycle_count,
+                "avg_node_count": ddtree_node_count_total / ddtree_cycle_count,
+                "max_tree_size": int(ddtree_tree_size_max),
+                "avg_acceptance_len": ddtree_acceptance_len_total / ddtree_cycle_count,
+                "avg_commit_count": ddtree_commit_count_total / ddtree_cycle_count,
+                "prefetch_hit_rate": (
+                    ddtree_prefetch_hits / max(1, ddtree_prefetch_hits + ddtree_prefetch_misses)
+                ),
+            }
+            summary["ddtree_timing_totals_us"] = {
+                key: _ns_to_us(value) for key, value in ddtree_timing_totals_ns.items()
+            }
+            summary["ddtree_timing_avg_us"] = {
+                key: _ns_to_us(value) / ddtree_cycle_count
+                for key, value in ddtree_timing_totals_ns.items()
+            }
         if profile_cycles:
             summary["cycle_profile_us"] = cycle_profiles
             summary["cycle_profile_totals_us"] = {

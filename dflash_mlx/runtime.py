@@ -109,8 +109,9 @@ def apply_repetition_penalty(
 ) -> mx.array:
     """Apply repetition penalty to logits in-place (lazy).
 
-    For each token that has already appeared, divide positive logits or
-    multiply negative logits by *penalty*.  A penalty of 1.0 is a no-op.
+    Penalizes tokens that have already appeared in the full conversation
+    (prompt + generated tokens). For each such token, divide positive logits
+    or multiply negative logits by *penalty*.  A penalty of 1.0 is a no-op.
     """
     if penalty == 1.0 or not generated_token_ids:
         return logits
