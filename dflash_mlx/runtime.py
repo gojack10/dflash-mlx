@@ -107,32 +107,38 @@ def apply_repetition_penalty(
     generated_token_ids: list[int],
     penalty: float,
 ) -> mx.array:
-    """Apply repetition penalty to logits in-place (lazy).
+    """Apply subtractive frequency penalty to logits.
 
-    Penalizes tokens that have already appeared in the full conversation
-    (prompt + generated tokens). For each such token, divide positive logits
-    or multiply negative logits by *penalty*.  A penalty of 1.0 is a no-op.
+    For each occurrence of a token in the history, subtract ``alpha`` from its
+    logit, where ``alpha = penalty - 1.0``. A token seen N times has its logit
+    reduced by ``N * alpha``. ``penalty=1.0`` is a no-op so the existing CLI
+    flag keeps working.
+
+    The previous multiplicative form penalized each unique token exactly once
+    (divide-by-penalty), which collapsed under long-context greedy verification:
+    after a paragraph looped a few times every token in it was already
+    penalized equally, leaving the loop's fixed point intact. Subtractive
+    scales linearly with count, so repeated tokens fall out of argmax range as
+    repetition grows. Values stay finite (no overflow, no NaN from 0*INF).
     """
     if penalty == 1.0 or not generated_token_ids:
         return logits
-    unique_ids = sorted(set(generated_token_ids))
-    if not unique_ids:
-        return logits
-    # Build a boolean mask for tokens that should be penalized
+    from collections import Counter
+
+    alpha = float(penalty) - 1.0
+    counts = Counter(generated_token_ids)
     vocab_size = int(logits.shape[-1])
-    valid_ids = [tid for tid in unique_ids if 0 <= tid < vocab_size]
-    if not valid_ids:
+    items = [(tid, c) for tid, c in counts.items() if 0 <= tid < vocab_size]
+    if not items:
         return logits
-    idx = mx.array(valid_ids, dtype=mx.int32)
-    # Fetch penalized logits, apply penalty, scatter back
-    penalized = mx.take(logits, idx, axis=-1)
-    penalized = mx.where(
-        penalized > 0,
-        penalized / penalty,
-        penalized * penalty,
-    )
+    ids = [tid for tid, _ in items]
+    shifts_py = [alpha * c for _, c in items]
+    idx = mx.array(ids, dtype=mx.int32)
+    shifts = mx.array(shifts_py, dtype=logits.dtype)
+    existing = mx.take(logits, idx, axis=-1)
+    new_values = existing - shifts
     scatter_idx = idx.reshape((1,) * (logits.ndim - 1) + (-1,))
-    return mx.put_along_axis(logits, scatter_idx, penalized, axis=-1)
+    return mx.put_along_axis(logits, scatter_idx, new_values, axis=-1)
 
 def _eval_logits_and_captured(
     logits: mx.array,
