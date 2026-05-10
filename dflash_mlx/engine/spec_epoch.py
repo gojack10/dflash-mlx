@@ -594,6 +594,20 @@ def stream_dflash_generate_impl(
         ddtree_mode = str(getattr(runtime_config, "speculative_mode", "dflash")).lower() == "ddtree"
         ddtree_budget = int(getattr(runtime_config, "ddtree_budget", 64) or 64)
         ddtree_topk = int(getattr(runtime_config, "ddtree_topk", 64) or 64)
+        ddtree_profile_totals_ns = {
+            "tree_build": 0,
+            "compile": 0,
+            "verify_setup": 0,
+            "verify_fa_layers": 0,
+            "verify_gdn_layers": 0,
+            "verify_final_norm": 0,
+            "verify_lm_head": 0,
+            "posterior_argmax": 0,
+            "tree_walk": 0,
+            "accepted_gather": 0,
+            "cache_commit": 0,
+            "next_draft_launch": 0,
+        }
         prefetched_draft: Optional[dict[str, Any]] = None
 
         while len(generated_token_ids) < max_new_tokens:
@@ -605,6 +619,14 @@ def stream_dflash_generate_impl(
             commit_cycle_ns = 0
             acceptance_cycle_ns = 0
             hidden_extract_cycle_ns = 0
+            ddtree_tree_build_ns = 0
+            ddtree_compile_ns = 0
+            ddtree_verify_profile: dict[str, Any] = {}
+            ddtree_posterior_ns = 0
+            ddtree_walk_ns = 0
+            ddtree_gather_ns = 0
+            ddtree_cache_commit_ns = 0
+            ddtree_next_draft_launch_ns = 0
             remaining = max_new_tokens - len(generated_token_ids)
             block_len = max(1, min(effective_block_tokens, remaining))
             block_token_buffer[:block_len] = int(draft_model.mask_token_id)
@@ -692,16 +714,22 @@ def stream_dflash_generate_impl(
                     tree_verify_forward,
                 )
 
+                _tree_build_start_ns = time.perf_counter_ns()
                 tree = build_ddtree_tree_from_mlx_topk(
                     draft_tree_top_ids,
                     draft_tree_top_log_probs,
                     budget=ddtree_budget,
                 )
                 mx.eval()  # sync: tree build complete, CPU data ready
+                ddtree_tree_build_ns = time.perf_counter_ns() - _tree_build_start_ns
 
                 # Compile tree
+                _compile_start_ns = time.perf_counter_ns()
                 root_token = int(staged_first.item())
                 ct = compile_tree(tree, root_token_id=root_token, prefix_len=start)
+                if profile_cycles:
+                    mx.eval(ct.input_ids, ct.position_ids, ct.attention_mask, ct.dfs_order, ct.inv_dfs_order)
+                ddtree_compile_ns = time.perf_counter_ns() - _compile_start_ns
 
                 if ddtree_debug:
                     sys.stderr.write(
@@ -714,16 +742,21 @@ def stream_dflash_generate_impl(
                 target_ops.arm_rollback(target_cache, prefix_len=start)
                 verify_start_ns = time.perf_counter_ns()
                 tree_cache_state: dict[str, Any] = {}
+                ddtree_verify_profile = {} if profile_cycles else {}
                 tree_logits, tree_hidden_states = tree_verify_forward(
                     target_model,
                     compiled_tree=ct,
                     cache=target_cache,
                     capture_layer_ids=capture_layer_ids,
                     tree_cache_state=tree_cache_state,
+                    profile=ddtree_verify_profile if profile_cycles else None,
                 )
+                if profile_cycles:
+                    mx.eval(tree_logits)
+                else:
+                    mx.eval()  # sync: verify forward complete
                 verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
                 verify_ns_total += verify_cycle_ns
-                mx.eval()  # sync: verify forward complete
                 if ddtree_debug:
                     sys.stderr.write(
                         f"[ddtree] verify complete: {verify_cycle_ns/1e6:.1f}ms\n"
@@ -731,27 +764,36 @@ def stream_dflash_generate_impl(
                     sys.stderr.flush()
 
                 # Walk tree
+                _posterior_start_ns = time.perf_counter_ns()
                 posterior_tokens = greedy_tokens_with_mask(tree_logits[0], suppress_token_mask)
                 posterior_list = posterior_tokens.tolist()
+                ddtree_posterior_ns = time.perf_counter_ns() - _posterior_start_ns
+                _walk_start_ns = time.perf_counter_ns()
                 accepted_indices, bonus_token = _follow_verified_tree(
                     tree.child_maps, posterior_list
                 )
+                ddtree_walk_ns = time.perf_counter_ns() - _walk_start_ns
                 acceptance_len = len(accepted_indices) - 1  # minus root
                 acceptance_history.append(acceptance_len)
 
                 # ── Use tree logits directly, skip re-verify ──
                 # Extract accepted node logits and hidden states from tree results.
+                _gather_start_ns = time.perf_counter_ns()
                 accepted_array = mx.array(accepted_indices, dtype=mx.int32)
                 verify_logits = mx.take(tree_logits[:, accepted_array, :], mx.array([0]), axis=0)
                 # Reconstruct hidden states for accepted nodes
                 captured_dict: dict[int, mx.array] = {}
                 for lid, hid in tree_hidden_states.items():
                     captured_dict[lid] = mx.take(hid, accepted_array, axis=1)
+                if profile_cycles:
+                    mx.eval(verify_logits, *captured_dict.values())
+                ddtree_gather_ns = time.perf_counter_ns() - _gather_start_ns
 
                 # Commit exactly the accepted path. FA KV was appended in DFS
                 # order, while GDN states were computed per tree node; gather
                 # only accepted nodes so the target cache matches vanilla DFlash.
                 target_len = start + 1 + acceptance_len
+                _cache_commit_start_ns = time.perf_counter_ns()
                 replay_cycle_ns = _commit_ddtree_target_cache(
                     target_cache,
                     start=start,
@@ -760,8 +802,11 @@ def stream_dflash_generate_impl(
                     inv_dfs_order=ct.inv_dfs_order.tolist(),
                     tree_cache_state=tree_cache_state,
                 )
-                replay_ns_total += replay_cycle_ns
                 mx.eval()  # sync: cache compaction complete
+                if profile_cycles:
+                    replay_cycle_ns = time.perf_counter_ns() - _cache_commit_start_ns
+                ddtree_cache_commit_ns = time.perf_counter_ns() - _cache_commit_start_ns
+                replay_ns_total += replay_cycle_ns
 
                 # Build accepted token sequence (for token yielding + committed_segment)
                 accepted_path_ids = [int(staged_first.item())]
@@ -949,6 +994,7 @@ def stream_dflash_generate_impl(
                         )
                         mx.async_eval(next_drafted, next_top_ids, next_top_log_probs)
                         launch_ns = time.perf_counter_ns() - draft_start_ns
+                        ddtree_next_draft_launch_ns = launch_ns
                         draft_ns_total += launch_ns
                         draft_incremental_ns += launch_ns
                         prefetched_draft = {
@@ -1001,12 +1047,20 @@ def stream_dflash_generate_impl(
 
             if profile_cycles:
                 cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
+                ddtree_named_ns = (
+                    ddtree_tree_build_ns
+                    + ddtree_compile_ns
+                    + ddtree_posterior_ns
+                    + ddtree_walk_ns
+                    + ddtree_gather_ns
+                ) if _ddtree_cycle else 0
                 named_ns = (
                     draft_cycle_ns
                     + verify_cycle_ns
                     + acceptance_cycle_ns
                     + hidden_extract_cycle_ns
                     + replay_cycle_ns
+                    + ddtree_named_ns
                 )
                 other_cycle_ns = max(0, cycle_total_ns - named_ns)
                 cycle_profile_entry = {
@@ -1022,6 +1076,31 @@ def stream_dflash_generate_impl(
                     "other_us": _ns_to_us(other_cycle_ns),
                     "cycle_total_us": _ns_to_us(cycle_total_ns),
                 }
+                if _ddtree_cycle:
+                    slow_layers = sorted(
+                        list(ddtree_verify_profile.get("layers", [])),
+                        key=lambda item: float(item.get("us", 0.0)),
+                        reverse=True,
+                    )[:6]
+                    cycle_profile_entry.update(
+                        {
+                            "ddtree_tree_size": int(getattr(tree, "tree_size", 0)),
+                            "ddtree_node_count": int(getattr(tree, "node_count", 0)),
+                            "ddtree_tree_build_us": _ns_to_us(ddtree_tree_build_ns),
+                            "ddtree_compile_us": _ns_to_us(ddtree_compile_ns),
+                            "ddtree_verify_setup_us": _ns_to_us(int(ddtree_verify_profile.get("setup_ns", 0))),
+                            "ddtree_verify_fa_layers_us": _ns_to_us(int(ddtree_verify_profile.get("fa_layers_ns", 0))),
+                            "ddtree_verify_gdn_layers_us": _ns_to_us(int(ddtree_verify_profile.get("gdn_layers_ns", 0))),
+                            "ddtree_verify_final_norm_us": _ns_to_us(int(ddtree_verify_profile.get("final_norm_ns", 0))),
+                            "ddtree_verify_lm_head_us": _ns_to_us(int(ddtree_verify_profile.get("lm_head_ns", 0))),
+                            "ddtree_posterior_argmax_us": _ns_to_us(ddtree_posterior_ns),
+                            "ddtree_tree_walk_us": _ns_to_us(ddtree_walk_ns),
+                            "ddtree_accepted_gather_us": _ns_to_us(ddtree_gather_ns),
+                            "ddtree_cache_commit_us": _ns_to_us(ddtree_cache_commit_ns),
+                            "ddtree_next_draft_launch_us": _ns_to_us(ddtree_next_draft_launch_ns),
+                            "ddtree_slowest_layers": slow_layers,
+                        }
+                    )
                 cycle_profiles.append(cycle_profile_entry)
                 _pre_yield = _yield_start()
                 yield {"event": "cycle_complete", **cycle_profile_entry}
@@ -1033,6 +1112,19 @@ def stream_dflash_generate_impl(
                 profile_totals_ns["rollback"] += replay_cycle_ns
                 profile_totals_ns["other"] += other_cycle_ns
                 profile_totals_ns["cycle_total"] += cycle_total_ns
+                if _ddtree_cycle:
+                    ddtree_profile_totals_ns["tree_build"] += ddtree_tree_build_ns
+                    ddtree_profile_totals_ns["compile"] += ddtree_compile_ns
+                    ddtree_profile_totals_ns["verify_setup"] += int(ddtree_verify_profile.get("setup_ns", 0))
+                    ddtree_profile_totals_ns["verify_fa_layers"] += int(ddtree_verify_profile.get("fa_layers_ns", 0))
+                    ddtree_profile_totals_ns["verify_gdn_layers"] += int(ddtree_verify_profile.get("gdn_layers_ns", 0))
+                    ddtree_profile_totals_ns["verify_final_norm"] += int(ddtree_verify_profile.get("final_norm_ns", 0))
+                    ddtree_profile_totals_ns["verify_lm_head"] += int(ddtree_verify_profile.get("lm_head_ns", 0))
+                    ddtree_profile_totals_ns["posterior_argmax"] += ddtree_posterior_ns
+                    ddtree_profile_totals_ns["tree_walk"] += ddtree_walk_ns
+                    ddtree_profile_totals_ns["accepted_gather"] += ddtree_gather_ns
+                    ddtree_profile_totals_ns["cache_commit"] += ddtree_cache_commit_ns
+                    ddtree_profile_totals_ns["next_draft_launch"] += ddtree_next_draft_launch_ns
 
         if (
             generation_snapshot_enabled
@@ -1129,6 +1221,9 @@ def stream_dflash_generate_impl(
             summary["cycle_profile_us"] = cycle_profiles
             summary["cycle_profile_totals_us"] = {
                 key: _ns_to_us(value) for key, value in profile_totals_ns.items()
+            }
+            summary["ddtree_profile_totals_us"] = {
+                key: _ns_to_us(value) for key, value in ddtree_profile_totals_ns.items()
             }
         yield summary
     finally:
