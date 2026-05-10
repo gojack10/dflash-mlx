@@ -70,8 +70,30 @@ def _commit_ddtree_target_cache(
     source_positions = int(start) + accepted_dfs
     final_tree_idx = int(accepted_indices[-1])
     gdn_layers = tree_cache_state.get("gdn_layers", {}) if tree_cache_state else {}
+    gdn_recompute_layers = tree_cache_state.get("gdn_recompute_layers", {}) if tree_cache_state else {}
+    accepted_array = mx.array([int(idx) for idx in accepted_indices], dtype=mx.int32)
 
     for layer_idx, cache_entry in enumerate(target_cache):
+        if layer_idx in gdn_recompute_layers:
+            layer_state = gdn_recompute_layers[layer_idx]
+            linear_attn = layer_state["linear_attn"]
+            path_inputs = mx.take(layer_state["inputs"], accepted_array, axis=1)
+            try:
+                from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
+
+                scratch = RecurrentRollbackCache(
+                    size=2,
+                    conv_kernel_size=int(getattr(cache_entry, "conv_kernel_size", 4)),
+                )
+                scratch[0] = cache_entry[0]
+                scratch[1] = cache_entry[1]
+                linear_attn(path_inputs, None, scratch)
+                cache_entry[0] = mx.contiguous(scratch[0]) if scratch[0] is not None else None
+                cache_entry[1] = mx.contiguous(scratch[1]) if scratch[1] is not None else None
+            finally:
+                _clear_cache_transients(cache_entry)
+            continue
+
         if layer_idx in gdn_layers:
             layer_state = gdn_layers[layer_idx]
             conv_states = layer_state["conv_states"]
@@ -620,6 +642,8 @@ def stream_dflash_generate_impl(
             acceptance_cycle_ns = 0
             hidden_extract_cycle_ns = 0
             ddtree_tree_build_ns = 0
+            ddtree_bonus_token_id: int | None = None
+            ddtree_committed_ids: list[int] | None = None
             ddtree_compile_ns = 0
             ddtree_verify_profile: dict[str, Any] = {}
             ddtree_posterior_ns = 0
@@ -780,7 +804,12 @@ def stream_dflash_generate_impl(
                 # Extract accepted node logits and hidden states from tree results.
                 _gather_start_ns = time.perf_counter_ns()
                 accepted_array = mx.array(accepted_indices, dtype=mx.int32)
-                verify_logits = mx.take(tree_logits[:, accepted_array, :], mx.array([0]), axis=0)
+                final_accepted_array = mx.array([accepted_indices[-1]], dtype=mx.int32)
+                # Only the final accepted node's logits are needed after the
+                # tree walk (for generation snapshots / next-token state).
+                # Hidden states still need the full accepted path for the
+                # draft model context feature.
+                verify_logits = mx.take(tree_logits, final_accepted_array, axis=1)
                 # Reconstruct hidden states for accepted nodes
                 captured_dict: dict[int, mx.array] = {}
                 for lid, hid in tree_hidden_states.items():
@@ -814,6 +843,8 @@ def stream_dflash_generate_impl(
                     accepted_path_ids.append(int(tree.node_token_ids[idx - 1]))
                 verify_token_ids = mx.array(accepted_path_ids, dtype=mx.uint32)
                 verify_hidden_states = captured_dict
+                ddtree_bonus_token_id = int(bonus_token)
+                ddtree_committed_ids = accepted_path_ids
 
                 # Verbose: log accepted tokens every 50 cycles
                 if ddtree_debug and (cycles_completed % 50 == 0 or cycles_completed < 5):
@@ -891,10 +922,11 @@ def stream_dflash_generate_impl(
                 if profile_cycles:
                     acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
             else:
-                # DDTree already computed acceptance via tree walk.
-                # posterior = target model greedy at each accepted node.
-                # Use verify_logits for the accepted nodes to extract posterior.
-                posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+                # DDTree already computed the verified posterior for all tree
+                # nodes during tree walk.  Do not run a second full-vocab
+                # argmax over the accepted path; the unmatched posterior token
+                # from the walk is the next staged token.
+                posterior = None
                 acceptance_cycle_ns = 0
             hidden_extract_start_ns = time.perf_counter_ns() if profile_cycles else 0
             committed_hidden = target_ops.extract_context_feature(
@@ -902,7 +934,10 @@ def stream_dflash_generate_impl(
                 target_layer_id_list,
             )[:, : (1 + acceptance_len), :]
             if profile_cycles:
-                mx.eval(committed_hidden, posterior)
+                if posterior is None:
+                    mx.eval(committed_hidden)
+                else:
+                    mx.eval(committed_hidden, posterior)
             else:
                 mx.async_eval(committed_hidden)
             if profile_cycles:
@@ -915,7 +950,10 @@ def stream_dflash_generate_impl(
             target_hidden = committed_hidden
             if supports_prefix_snapshot:
                 gen_hidden_chunks.append(committed_hidden)
-            last_cycle_logits = verify_logits[:, acceptance_len, :]
+            if _ddtree_cycle:
+                last_cycle_logits = verify_logits[:, -1, :]
+            else:
+                last_cycle_logits = verify_logits[:, acceptance_len, :]
             if not _ddtree_cycle:
                 replay_cycle_ns = target_ops.restore_after_acceptance(
                     target_cache,
@@ -947,7 +985,12 @@ def stream_dflash_generate_impl(
             commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
 
             accepted_from_draft += acceptance_len
-            staged_first_next = posterior[acceptance_len : acceptance_len + 1]
+            if _ddtree_cycle:
+                if ddtree_bonus_token_id is None:
+                    raise RuntimeError("DDTree cycle missing bonus token")
+                staged_first_next = mx.array([ddtree_bonus_token_id], dtype=mx.uint32)
+            else:
+                staged_first_next = posterior[acceptance_len : acceptance_len + 1]
             if not profile_cycles and not ddtree_mode:
                 next_remaining = max_new_tokens - len(generated_token_ids) - commit_count
                 next_block_len = max(1, min(effective_block_tokens, next_remaining))
@@ -1010,7 +1053,10 @@ def stream_dflash_generate_impl(
                         prefetched_draft = None
                 else:
                     prefetched_draft = None
-            committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
+            if _ddtree_cycle and ddtree_committed_ids is not None:
+                committed_ids = ddtree_committed_ids[:commit_count]
+            else:
+                committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
             for token_id in committed_ids:
                 if len(generated_token_ids) >= max_new_tokens:
                     break
@@ -1031,15 +1077,18 @@ def stream_dflash_generate_impl(
                 _yield_done(_pre_yield)
 
             stop_hit = False
-            if stop_token_array is not None:
-                stop_hit = bool(
-                    mx.any(
-                        mx.equal(
-                            committed_segment[:, None],
-                            stop_token_array[None, :],
-                        )
-                    ).item()
-                )
+            if stop_token_ids:
+                if _ddtree_cycle:
+                    stop_hit = any(int(token_id) in stop_token_ids for token_id in committed_ids)
+                elif stop_token_array is not None:
+                    stop_hit = bool(
+                        mx.any(
+                            mx.equal(
+                                committed_segment[:, None],
+                                stop_token_array[None, :],
+                            )
+                        ).item()
+                    )
             if stop_hit:
                 break
 
