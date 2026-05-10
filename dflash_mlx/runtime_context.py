@@ -49,6 +49,7 @@ def runtime_config_from_profile(
     ddtree_budget: int | None = None,
     ddtree_topk: int | None = None,
     ddtree_dense_mask: bool | None = None,
+    generation_snapshot: bool | None = None,
 ) -> EffectiveRuntimeConfig:
     runtime_profile = PROFILES[profile]
     return validate_runtime_config(
@@ -113,6 +114,11 @@ def runtime_config_from_profile(
             ddtree_budget=runtime_profile.ddtree_budget if ddtree_budget is None else int(ddtree_budget),
             ddtree_topk=runtime_profile.ddtree_topk if ddtree_topk is None else int(ddtree_topk),
             ddtree_dense_mask=runtime_profile.ddtree_dense_mask if ddtree_dense_mask is None else bool(ddtree_dense_mask),
+            generation_snapshot=(
+                runtime_profile.generation_snapshot
+                if generation_snapshot is None
+                else bool(generation_snapshot)
+            ),
         )
     )
 

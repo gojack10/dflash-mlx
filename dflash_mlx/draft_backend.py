@@ -78,7 +78,7 @@ class EagerDraftBackend:
             mx.eval(draft_logits)
         return drafted
 
-    def draft_logits(
+    def _draft_logits_impl(
         self,
         *,
         target_model: Any,
@@ -89,18 +89,8 @@ class EagerDraftBackend:
         block_len: int,
         mask_token_tail: mx.array,
     ) -> mx.array:
-        """Return raw per-position logits for DDTree construction.
-
-        Same forward pass as draft_greedy but returns the [B-1, vocab]
-        logits tensor instead of argmax tokens.  Caller is responsible for
-        evaluating / transferring data.
-
-        Returns
-        -------
-        mx.array  shape (block_len - 1, vocab_size)  dtype=float32
-        """
         if int(block_len) <= 1:
-            raise ValueError("draft_logits requires block_len > 1")
+            raise ValueError("draft logits require block_len > 1")
 
         block_token_ids = mx.concatenate(
             [staged_first[:1], mask_token_tail[: int(block_len) - 1]],
@@ -116,6 +106,76 @@ class EagerDraftBackend:
         return target_ops.logits_from_hidden(
             target_model, draft_hidden[:, 1:, :]
         )
+
+    def draft_logits(
+        self,
+        *,
+        target_model: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        staged_first: mx.array,
+        target_hidden: mx.array,
+        block_len: int,
+        mask_token_tail: mx.array,
+    ) -> mx.array:
+        """Return raw per-position logits for DDTree construction.
+
+        Same forward pass as draft_greedy but returns the [B-1, vocab]
+        logits tensor instead of argmax tokens. Caller is responsible for
+        evaluating / transferring data.
+        """
+        return self._draft_logits_impl(
+            target_model=target_model,
+            draft_model=draft_model,
+            draft_cache=draft_cache,
+            staged_first=staged_first,
+            target_hidden=target_hidden,
+            block_len=block_len,
+            mask_token_tail=mask_token_tail,
+        )
+
+    def draft_topk(
+        self,
+        *,
+        target_model: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        staged_first: mx.array,
+        target_hidden: mx.array,
+        block_len: int,
+        mask_token_tail: mx.array,
+        topk: int,
+        suppress_token_mask: Optional[mx.array],
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """Return greedy draft tokens plus top-k log-probs for DDTree.
+
+        Keeps full-vocab logits on device and transfers only top-k IDs/log-probs
+        to the tree builder. This avoids a second top-k/argmax pass in the
+        DDTree loop and keeps the full logits tensor scoped to this method.
+        """
+        logits = self._draft_logits_impl(
+            target_model=target_model,
+            draft_model=draft_model,
+            draft_cache=draft_cache,
+            staged_first=staged_first,
+            target_hidden=target_hidden,
+            block_len=block_len,
+            mask_token_tail=mask_token_tail,
+        )
+        masked_logits = logits
+        if suppress_token_mask is not None:
+            floor = mx.array(-1e9, dtype=logits.dtype)
+            masked_logits = mx.where(suppress_token_mask, floor, logits)
+        greedy = mx.argmax(masked_logits, axis=-1).astype(mx.uint32).squeeze(0)
+        k = max(1, min(int(topk), int(masked_logits.shape[-1])))
+        dlogits = masked_logits.astype(mx.float32)
+        top_indices = mx.argpartition(-dlogits, kth=k - 1, axis=-1)[:, :, :k]
+        top_logits = mx.take_along_axis(dlogits, top_indices, axis=-1)
+        sort_order = mx.argsort(-top_logits, axis=-1)
+        top_token_ids = mx.take_along_axis(top_indices, sort_order, axis=-1).astype(mx.uint32)
+        top_logits = mx.take_along_axis(top_logits, sort_order, axis=-1)
+        top_log_probs = (top_logits - mx.logsumexp(dlogits, axis=-1, keepdims=True)).astype(mx.float32)
+        return greedy, top_token_ids.squeeze(0), top_log_probs.squeeze(0)
 
 
 def make_draft_backend() -> EagerDraftBackend:

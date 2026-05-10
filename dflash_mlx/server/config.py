@@ -232,6 +232,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Verify path mode. Use off only for debug/parity.",
     )
     parser.add_argument(
+        "--generation-snapshot",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable end-of-request generation snapshots.",
+    )
+    parser.add_argument(
         "--max-snapshot-tokens",
         type=int,
         default=None,

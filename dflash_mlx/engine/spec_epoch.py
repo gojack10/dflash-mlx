@@ -37,6 +37,84 @@ from dflash_mlx.engine.memory_waterfall import (
     should_sample_cycle as _should_sample_memory_cycle,
 )
 
+
+def _clear_cache_transients(cache_entry: Any) -> None:
+    clear = getattr(cache_entry, "clear_transients", None)
+    if clear is not None:
+        clear()
+        return
+    for attr in ("_armed", "_tape", "_tape_k", "_tape_g", "_tape_qkv", "_snapshot"):
+        if hasattr(cache_entry, attr):
+            setattr(cache_entry, attr, False if attr == "_armed" else None)
+
+
+def _commit_ddtree_target_cache(
+    target_cache: list[Any],
+    *,
+    start: int,
+    target_len: int,
+    accepted_indices: list[int],
+    inv_dfs_order: Any,
+    tree_cache_state: dict[str, Any],
+) -> int:
+    """Commit only the DDTree accepted path to target caches.
+
+    Tree verification appends FA KV in DFS order and computes GDN states for
+    every tree node without mutating the recurrent cache.  To preserve exact
+    vanilla-DFlash semantics, gather the accepted path into FA KV caches and set
+    each GDN cache to the state of the final accepted node.
+    """
+    commit_start_ns = time.perf_counter_ns()
+    accepted_dfs_positions = [int(inv_dfs_order[int(idx)]) for idx in accepted_indices]
+    accepted_dfs = mx.array(accepted_dfs_positions, dtype=mx.int32)
+    source_positions = int(start) + accepted_dfs
+    final_tree_idx = int(accepted_indices[-1])
+    gdn_layers = tree_cache_state.get("gdn_layers", {}) if tree_cache_state else {}
+
+    for layer_idx, cache_entry in enumerate(target_cache):
+        if layer_idx in gdn_layers:
+            layer_state = gdn_layers[layer_idx]
+            conv_states = layer_state["conv_states"]
+            recurrent_states = layer_state["states"]
+            if isinstance(conv_states, dict) and "all" in conv_states:
+                conv_state = mx.take(conv_states["all"], mx.array([final_tree_idx]), axis=0)
+            else:
+                conv_state = conv_states[final_tree_idx]
+            if isinstance(recurrent_states, dict) and "all" in recurrent_states:
+                recurrent_state = mx.take(recurrent_states["all"], mx.array([final_tree_idx]), axis=0)
+            else:
+                recurrent_state = recurrent_states[final_tree_idx]
+            cache_entry[0] = mx.contiguous(conv_state)
+            cache_entry[1] = mx.contiguous(recurrent_state)
+            _clear_cache_transients(cache_entry)
+            continue
+
+        keys = getattr(cache_entry, "keys", None)
+        values = getattr(cache_entry, "values", None)
+        if keys is not None and values is not None and hasattr(cache_entry, "offset"):
+            offset = int(getattr(cache_entry, "offset", 0) or 0)
+            if offset > int(start):
+                selected_keys = mx.take(keys, source_positions, axis=2)
+                selected_values = mx.take(values, source_positions, axis=2)
+                cache_entry.keys[..., int(start):int(target_len), :] = selected_keys
+                cache_entry.values[..., int(start):int(target_len), :] = selected_values
+                cache_entry.offset = int(target_len)
+            continue
+
+        if hasattr(cache_entry, "trim"):
+            offset = int(getattr(cache_entry, "offset", 0) or 0)
+            if offset > int(target_len):
+                cache_entry.trim(offset - int(target_len))
+        elif hasattr(cache_entry, "offset"):
+            offset = int(getattr(cache_entry, "offset", 0) or 0)
+            if offset > int(target_len):
+                cache_entry.offset = int(target_len)
+        elif hasattr(cache_entry, "crop"):
+            cache_entry.crop(int(target_len))
+
+    return time.perf_counter_ns() - commit_start_ns
+
+
 def stream_dflash_generate_impl(
     *,
     target_model: Any,
@@ -64,6 +142,7 @@ def stream_dflash_generate_impl(
     )
     target_ops = resolve_target_ops(target_model)
     bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
+
     target_capabilities = target_ops.capabilities_for(target_model)
     supports_prefix_snapshot = bool(
         getattr(target_capabilities, "supports_prefix_snapshot", True)
@@ -184,7 +263,10 @@ def stream_dflash_generate_impl(
         }
 
     _yield_pause_ns = 0
-    track_yield_pause = bool(profile_cycles or memory_waterfall)
+    # Always track time spent outside the generator while the server handles
+    # yielded events (streaming, prefix-cache snapshot insertion, diagnostics).
+    # Summary elapsed_us is core runtime; request logs also report wall time.
+    track_yield_pause = True
 
     def _yield_start() -> int:
         return time.perf_counter_ns() if track_yield_pause else 0
@@ -497,6 +579,9 @@ def stream_dflash_generate_impl(
         seen_draft_cycle = False
         acceptance_history: list[int] = []
         cycle_profiles: list[dict[str, Any]] = []
+        generation_snapshot_ns = 0
+        ddtree_debug = bool(profile_cycles)
+        generation_snapshot_enabled = bool(getattr(runtime_config, "generation_snapshot", True))
         profile_totals_ns = {
             "draft": 0,
             "verify": 0,
@@ -528,33 +613,46 @@ def stream_dflash_generate_impl(
             current_staged_first = staged_first
             drafted = None
 
-            draft_logit_tensor: Any = None  # captured for DDTree mode
+            draft_tree_top_ids: Any = None
+            draft_tree_top_log_probs: Any = None
             if block_len > 1:
                 if ddtree_mode:
-                    # DDTree mode: capture draft logits for tree construction.
-                    # We also still need drafted tokens for the verify fallback.
-                    draft_start_ns = time.perf_counter_ns()
-                    draft_logit_tensor = draft_backend.draft_logits(
-                        target_model=target_model,
-                        draft_model=draft_model,
-                        draft_cache=draft_cache,
-                        staged_first=current_staged_first,
-                        target_hidden=target_hidden,
-                        block_len=block_len,
-                        mask_token_tail=mask_token_tail,
-                    )
-                    from dflash_mlx import runtime as runtime_mod
-                    drafted = runtime_mod.greedy_tokens_with_mask(
-                        draft_logit_tensor,
-                        suppress_token_mask,
-                    ).squeeze(0)
-                    if profile_cycles:
-                        mx.eval(drafted)
+                    # DDTree mode: compute greedy draft tokens plus compact
+                    # top-k distributions in one draft forward pass. Full-vocab
+                    # logits stay scoped inside the backend.  In production we
+                    # pre-launch the next cycle's draft_topk after commit, then
+                    # consume it here so draft work overlaps token yielding.
+                    if (
+                        prefetched_draft is not None
+                        and prefetched_draft.get("mode") == "ddtree"
+                        and int(prefetched_draft["block_len"]) == block_len
+                        and int(prefetched_draft.get("topk", 0)) == min(ddtree_topk, ddtree_budget)
+                    ):
+                        drafted = prefetched_draft["drafted"]
+                        draft_tree_top_ids = prefetched_draft["top_ids"]
+                        draft_tree_top_log_probs = prefetched_draft["top_log_probs"]
+                        current_staged_first = prefetched_draft["staged_first"]
+                        prefetched_draft = None
                     else:
-                        mx.async_eval(drafted)
-                    draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                        draft_start_ns = time.perf_counter_ns()
+                        drafted, draft_tree_top_ids, draft_tree_top_log_probs = draft_backend.draft_topk(
+                            target_model=target_model,
+                            draft_model=draft_model,
+                            draft_cache=draft_cache,
+                            staged_first=current_staged_first,
+                            target_hidden=target_hidden,
+                            block_len=block_len,
+                            mask_token_tail=mask_token_tail,
+                            topk=min(ddtree_topk, ddtree_budget),
+                            suppress_token_mask=suppress_token_mask,
+                        )
+                        if profile_cycles:
+                            mx.eval(drafted, draft_tree_top_ids, draft_tree_top_log_probs)
+                        else:
+                            mx.async_eval(drafted, draft_tree_top_ids, draft_tree_top_log_probs)
+                        draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
                     block_token_ids[1:block_len] = drafted
-                elif profile_cycles:
+                else:
                     if (
                         prefetched_draft is not None
                         and int(prefetched_draft["block_len"]) == block_len
@@ -585,46 +683,52 @@ def stream_dflash_generate_impl(
 
             verify_token_count = verify_token_count_for_block(block_len, verify_len_cap)
 
-            if ddtree_mode and draft_logit_tensor is not None and block_len > 1:
+            if ddtree_mode and draft_tree_top_ids is not None and block_len > 1:
                 # ── DDTree verification path ──
                 from vllm_mlx.engine.ddtree import (
-                    build_ddtree_tree_from_mlx,
+                    build_ddtree_tree_from_mlx_topk,
                     compile_tree,
                     follow_verified_tree as _follow_verified_tree,
                     tree_verify_forward,
                 )
 
-                # draft_logit_tensor has shape (1, block_len-1, vocab)
-                draft_logits_2d = draft_logit_tensor.squeeze(0)
-                tree = build_ddtree_tree_from_mlx(draft_logits_2d, budget=ddtree_budget)
+                tree = build_ddtree_tree_from_mlx_topk(
+                    draft_tree_top_ids,
+                    draft_tree_top_log_probs,
+                    budget=ddtree_budget,
+                )
                 mx.eval()  # sync: tree build complete, CPU data ready
 
                 # Compile tree
                 root_token = int(staged_first.item())
                 ct = compile_tree(tree, root_token_id=root_token, prefix_len=start)
 
-                sys.stderr.write(
-                    f"[ddtree] tree_size={ct.tree_size} root={root_token} "
-                    f"prefix_len={start}\n"
-                )
-                sys.stderr.flush()
+                if ddtree_debug:
+                    sys.stderr.write(
+                        f"[ddtree] tree_size={ct.tree_size} root={root_token} "
+                        f"prefix_len={start}\n"
+                    )
+                    sys.stderr.flush()
 
                 # Arm rollback, verify tree forward, walk
                 target_ops.arm_rollback(target_cache, prefix_len=start)
                 verify_start_ns = time.perf_counter_ns()
+                tree_cache_state: dict[str, Any] = {}
                 tree_logits, tree_hidden_states = tree_verify_forward(
                     target_model,
                     compiled_tree=ct,
                     cache=target_cache,
                     capture_layer_ids=capture_layer_ids,
+                    tree_cache_state=tree_cache_state,
                 )
                 verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
                 verify_ns_total += verify_cycle_ns
                 mx.eval()  # sync: verify forward complete
-                sys.stderr.write(
-                    f"[ddtree] verify complete: {verify_cycle_ns/1e6:.1f}ms\n"
-                )
-                sys.stderr.flush()
+                if ddtree_debug:
+                    sys.stderr.write(
+                        f"[ddtree] verify complete: {verify_cycle_ns/1e6:.1f}ms\n"
+                    )
+                    sys.stderr.flush()
 
                 # Walk tree
                 posterior_tokens = greedy_tokens_with_mask(tree_logits[0], suppress_token_mask)
@@ -644,19 +748,20 @@ def stream_dflash_generate_impl(
                 for lid, hid in tree_hidden_states.items():
                     captured_dict[lid] = mx.take(hid, accepted_array, axis=1)
 
-                # Compact KV: restore_after_acceptance keeps first (1+acceptance_len)
-                # tree nodes and discards the rest. Works when accepted nodes are
-                # contiguous in tree-index order (common for small budgets).
+                # Commit exactly the accepted path. FA KV was appended in DFS
+                # order, while GDN states were computed per tree node; gather
+                # only accepted nodes so the target cache matches vanilla DFlash.
                 target_len = start + 1 + acceptance_len
-                drafted_tokens = tree.tree_size - 1
-                replay_cycle_ns = target_ops.restore_after_acceptance(
+                replay_cycle_ns = _commit_ddtree_target_cache(
                     target_cache,
+                    start=start,
                     target_len=target_len,
-                    acceptance_length=acceptance_len,
-                    drafted_tokens=drafted_tokens,
+                    accepted_indices=accepted_indices,
+                    inv_dfs_order=ct.inv_dfs_order.tolist(),
+                    tree_cache_state=tree_cache_state,
                 )
                 replay_ns_total += replay_cycle_ns
-                mx.eval()  # sync: restore complete
+                mx.eval()  # sync: cache compaction complete
 
                 # Build accepted token sequence (for token yielding + committed_segment)
                 accepted_path_ids = [int(staged_first.item())]
@@ -665,15 +770,18 @@ def stream_dflash_generate_impl(
                 verify_token_ids = mx.array(accepted_path_ids, dtype=mx.uint32)
                 verify_hidden_states = captured_dict
 
-                # Set verify_logits for downstream (posterior extract)
-                # verify_logits already set above from tree
+                # Verbose: log accepted tokens every 50 cycles
+                if ddtree_debug and (cycles_completed % 50 == 0 or cycles_completed < 5):
+                    sys.stderr.write(
+                        f"[ddtree] cyc={cycles_completed} acc={accepted_path_ids[:6]}"
+                        f" bonus={bonus_token} nodes={tree.node_count}\n"
+                    )
+                    sys.stderr.flush()
+
+                sample_memory_cycle = False
 
                 # Flag: shared code should skip its own acceptance computation
-                # and second restore — we already did both above.
                 _ddtree_cycle = True
-
-                # Memory waterfall not sampled in DDTree path yet
-                sample_memory_cycle = False
 
             else:
                 _ddtree_cycle = False
@@ -795,7 +903,7 @@ def stream_dflash_generate_impl(
 
             accepted_from_draft += acceptance_len
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
-            if not profile_cycles:
+            if not profile_cycles and not ddtree_mode:
                 next_remaining = max_new_tokens - len(generated_token_ids) - commit_count
                 next_block_len = max(1, min(effective_block_tokens, next_remaining))
                 if next_remaining > 0 and next_block_len > 1:
@@ -819,6 +927,41 @@ def stream_dflash_generate_impl(
                         "staged_first": staged_first_next,
                         "drafted": next_drafted,
                     }
+                else:
+                    prefetched_draft = None
+            elif ddtree_mode:
+                if not profile_cycles:
+                    next_remaining = max_new_tokens - len(generated_token_ids) - commit_count
+                    next_block_len = max(1, min(effective_block_tokens, next_remaining))
+                    if next_remaining > 0 and next_block_len > 1:
+                        draft_start_ns = time.perf_counter_ns()
+                        next_topk = min(ddtree_topk, ddtree_budget)
+                        next_drafted, next_top_ids, next_top_log_probs = draft_backend.draft_topk(
+                            target_model=target_model,
+                            draft_model=draft_model,
+                            draft_cache=draft_cache,
+                            staged_first=staged_first_next,
+                            target_hidden=committed_hidden,
+                            block_len=next_block_len,
+                            mask_token_tail=mask_token_tail,
+                            topk=next_topk,
+                            suppress_token_mask=suppress_token_mask,
+                        )
+                        mx.async_eval(next_drafted, next_top_ids, next_top_log_probs)
+                        launch_ns = time.perf_counter_ns() - draft_start_ns
+                        draft_ns_total += launch_ns
+                        draft_incremental_ns += launch_ns
+                        prefetched_draft = {
+                            "mode": "ddtree",
+                            "block_len": next_block_len,
+                            "topk": next_topk,
+                            "staged_first": staged_first_next,
+                            "drafted": next_drafted,
+                            "top_ids": next_top_ids,
+                            "top_log_probs": next_top_log_probs,
+                        }
+                    else:
+                        prefetched_draft = None
                 else:
                     prefetched_draft = None
             committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
@@ -892,30 +1035,33 @@ def stream_dflash_generate_impl(
                 profile_totals_ns["cycle_total"] += cycle_total_ns
 
         if (
-            supports_prefix_snapshot
+            generation_snapshot_enabled
+            and supports_prefix_snapshot
             and generated_token_ids
             and prefill_target_hidden_for_snapshot is not None
             and gen_hidden_chunks
         ):
+            generation_snapshot_start_ns = time.perf_counter_ns()
             try:
                 gen_hidden = (
                     gen_hidden_chunks[0]
                     if len(gen_hidden_chunks) == 1
                     else mx.concatenate(gen_hidden_chunks, axis=1)
                 )
+                # Keep this lazy; Rapid handles generation_snapshot_ready on a
+                # background executor and build_snapshot() will evaluate/clamp
+                # the arrays there. The shallow cache list copy survives normal
+                # target_cache list cleanup while retaining the cache objects.
                 end_target_hidden = mx.concatenate(
                     [prefill_target_hidden_for_snapshot, gen_hidden], axis=1
                 )
-                mx.eval(end_target_hidden)
-                if last_cycle_logits is not None:
-                    mx.eval(last_cycle_logits)
                 _clear_cache_boundary()
                 end_total_len = prompt_len + len(generated_token_ids)
                 _pre_yield = _yield_start()
                 yield {
                     "event": "generation_snapshot_ready",
                     "token_ids": list(prompt_tokens) + list(generated_token_ids),
-                    "target_cache": target_cache,
+                    "target_cache": list(target_cache),
                     "target_hidden": end_target_hidden,
                     "last_logits": last_cycle_logits,
                     "snapshot_boundary": end_total_len,
@@ -937,6 +1083,8 @@ def stream_dflash_generate_impl(
                     f"[dflash] generation_snapshot_ready build failed: {_gen_snap_err}\n"
                 )
                 sys.stderr.flush()
+            finally:
+                generation_snapshot_ns += time.perf_counter_ns() - generation_snapshot_start_ns
 
         elapsed_us = (time.perf_counter_ns() - start_ns - _yield_pause_ns) / 1_000.0
         first_20 = acceptance_history[:20]
@@ -961,6 +1109,8 @@ def stream_dflash_generate_impl(
                 "verify": verify_ns_total / 1_000.0,
                 "replay": replay_ns_total / 1_000.0,
                 "commit": commit_ns_total / 1_000.0,
+                "generation_snapshot": generation_snapshot_ns / 1_000.0,
+                "yield_pause": _yield_pause_ns / 1_000.0,
             },
             "verify_len_cap": int(verify_len_cap),
             "quantize_kv_cache": bool(quantize_kv_cache),
@@ -968,6 +1118,7 @@ def stream_dflash_generate_impl(
             "draft_sink_size": int(draft_sink_size),
             "draft_window_size": int(draft_window_size),
             "clear_cache_boundaries": bool(clear_cache_boundaries),
+            "generation_snapshot": bool(generation_snapshot_enabled),
             "tokens_per_cycle": (len(generated_token_ids) / cycles_completed) if cycles_completed > 0 else 0.0,
             "acceptance_history": list(acceptance_history),
             "acceptance_first_20_avg": (sum(first_20) / len(first_20)) if first_20 else 0.0,

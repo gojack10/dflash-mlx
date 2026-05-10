@@ -27,9 +27,10 @@ class RuntimeProfile:
     prefix_cache_l2_max_bytes: int
     verify_mode: str
     speculative_mode: str = "dflash"
-    ddtree_budget: int = 16
+    ddtree_budget: int = 32
     ddtree_topk: int = 64
     ddtree_dense_mask: bool = False
+    generation_snapshot: bool = True
 
 @dataclass(frozen=True)
 class EffectiveRuntimeConfig:
@@ -55,6 +56,7 @@ class EffectiveRuntimeConfig:
     ddtree_budget: int
     ddtree_topk: int
     ddtree_dense_mask: bool
+    generation_snapshot: bool
 
 PROFILES: dict[str, RuntimeProfile] = {
     "balanced": RuntimeProfile(
@@ -271,6 +273,11 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             getattr(args, "ddtree_dense_mask", None),
             "DFLASH_DDTREE_DENSE_MASK",
             profile.ddtree_dense_mask,
+        ),
+        generation_snapshot=_resolve_bool(
+            getattr(args, "generation_snapshot", None),
+            "DFLASH_GENERATION_SNAPSHOT",
+            profile.generation_snapshot,
         ),
     )
     return validate_runtime_config(cfg)
