@@ -595,7 +595,13 @@ def stream_dflash_generate_impl(
 
         draft_block_size = int(draft_model.block_size)
         requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
-        effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
+        # DFlash draft models are trained/configured with a nominal block size,
+        # but the architecture is fully causal and can run longer speculative
+        # blocks.  Keep the default at the model's block_size, while honoring an
+        # explicit block_tokens override for controlled throughput experiments.
+        # Target verification remains exact, so a too-long draft can only lower
+        # acceptance/performance, not corrupt output.
+        effective_block_tokens = max(1, requested_block_tokens)
         block_token_buffer = mx.full(
             (effective_block_tokens,),
             int(draft_model.mask_token_id),
