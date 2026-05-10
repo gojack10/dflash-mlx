@@ -101,6 +101,37 @@ def greedy_tokens_with_mask(
     masked_logits = mx.where(suppress_token_mask, floor, logits)
     return mx.argmax(masked_logits, axis=-1).astype(mx.uint32)
 
+
+def apply_repetition_penalty(
+    logits: mx.array,
+    generated_token_ids: list[int],
+    penalty: float,
+) -> mx.array:
+    """Apply repetition penalty to logits in-place (lazy).
+
+    For each token that has already appeared, divide positive logits or
+    multiply negative logits by *penalty*.  A penalty of 1.0 is a no-op.
+    """
+    if penalty == 1.0 or not generated_token_ids:
+        return logits
+    unique_ids = sorted(set(generated_token_ids))
+    if not unique_ids:
+        return logits
+    # Build a boolean mask for tokens that should be penalized
+    vocab_size = int(logits.shape[-1])
+    valid_ids = [tid for tid in unique_ids if 0 <= tid < vocab_size]
+    if not valid_ids:
+        return logits
+    idx = mx.array(valid_ids, dtype=mx.int32)
+    # Fetch penalized logits, apply penalty, scatter back
+    penalized = mx.take(logits, idx, axis=-1)
+    penalized = mx.where(
+        penalized > 0,
+        penalized / penalty,
+        penalized * penalty,
+    )
+    return mx.put_along_axis(logits, idx[None, :], penalized, axis=-1)
+
 def _eval_logits_and_captured(
     logits: mx.array,
     captured: list[mx.array] | dict[int, mx.array],

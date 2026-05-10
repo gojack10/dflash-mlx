@@ -159,6 +159,7 @@ def stream_dflash_generate_impl(
         _eval_logits_and_captured,
         _ns_to_us,
         _prepare_prompt_tokens,
+        apply_repetition_penalty,
         build_suppress_token_mask,
         greedy_tokens_with_mask,
     )
@@ -532,7 +533,12 @@ def stream_dflash_generate_impl(
         last_cycle_logits: Optional[mx.array] = None
 
         suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
-        staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
+        rep_penalty = float(getattr(runtime_config, "repetition_penalty", 1.0) or 1.0)
+        _sampled_ids: list[int] = []  # track generated tokens for repetition penalty
+        staged_first = greedy_tokens_with_mask(
+            apply_repetition_penalty(prefill_logits[:, -1:, :], _sampled_ids, rep_penalty).squeeze(0),
+            suppress_token_mask,
+        ).reshape(-1)
         prefill_tokens_restored = max(0, min(int(snap_prefix_len), int(prompt_len)))
         prefill_tokens_computed = max(0, int(prompt_len) - prefill_tokens_restored)
 
@@ -789,7 +795,10 @@ def stream_dflash_generate_impl(
 
                 # Walk tree
                 _posterior_start_ns = time.perf_counter_ns()
-                posterior_tokens = greedy_tokens_with_mask(tree_logits[0], suppress_token_mask)
+                posterior_tokens = greedy_tokens_with_mask(
+                    apply_repetition_penalty(tree_logits[0], _sampled_ids, rep_penalty),
+                    suppress_token_mask,
+                )
                 posterior_list = posterior_tokens.tolist()
                 ddtree_posterior_ns = time.perf_counter_ns() - _posterior_start_ns
                 _walk_start_ns = time.perf_counter_ns()
@@ -912,7 +921,10 @@ def stream_dflash_generate_impl(
 
             if not _ddtree_cycle:
                 acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
-                posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+                posterior = greedy_tokens_with_mask(
+                    apply_repetition_penalty(verify_logits[0], _sampled_ids, rep_penalty),
+                    suppress_token_mask,
+                )
                 if not profile_cycles:
                     mx.async_eval(posterior)
                 acceptance_len = int(
@@ -1061,6 +1073,7 @@ def stream_dflash_generate_impl(
                 if len(generated_token_ids) >= max_new_tokens:
                     break
                 generated_token_ids.append(token_id)
+                _sampled_ids.append(token_id)
                 if first_token_yielded:
                     first_token_yielded = False
                     continue

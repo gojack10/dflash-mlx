@@ -31,6 +31,7 @@ class RuntimeProfile:
     ddtree_topk: int = 64
     ddtree_dense_mask: bool = False
     generation_snapshot: bool = True
+    repetition_penalty: float = 1.0
 
 @dataclass(frozen=True)
 class EffectiveRuntimeConfig:
@@ -57,6 +58,7 @@ class EffectiveRuntimeConfig:
     ddtree_topk: int
     ddtree_dense_mask: bool
     generation_snapshot: bool
+    repetition_penalty: float
 
 PROFILES: dict[str, RuntimeProfile] = {
     "balanced": RuntimeProfile(
@@ -279,6 +281,11 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             "DFLASH_GENERATION_SNAPSHOT",
             profile.generation_snapshot,
         ),
+        repetition_penalty=_resolve_float(
+            getattr(args, "repetition_penalty", None),
+            "DFLASH_REPETITION_PENALTY",
+            profile.repetition_penalty,
+        ),
     )
     return validate_runtime_config(cfg)
 
@@ -344,6 +351,14 @@ def _resolve_int(cli_value: Optional[int], env_key: str, default: int) -> int:
     if raw:
         return int(raw)
     return int(default)
+
+def _resolve_float(cli_value: Optional[float], env_key: str, default: float) -> float:
+    if cli_value is not None:
+        return float(cli_value)
+    raw = os.environ.get(env_key, "").strip()
+    if raw:
+        return float(raw)
+    return float(default)
 
 def _resolve_bool(cli_value: Optional[bool], env_key: str, default: bool) -> bool:
     if cli_value is not None:

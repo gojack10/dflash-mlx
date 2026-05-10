@@ -50,6 +50,7 @@ def runtime_config_from_profile(
     ddtree_topk: int | None = None,
     ddtree_dense_mask: bool | None = None,
     generation_snapshot: bool | None = None,
+    repetition_penalty: float | None = None,
 ) -> EffectiveRuntimeConfig:
     runtime_profile = PROFILES[profile]
     return validate_runtime_config(
@@ -118,6 +119,11 @@ def runtime_config_from_profile(
                 runtime_profile.generation_snapshot
                 if generation_snapshot is None
                 else bool(generation_snapshot)
+            ),
+            repetition_penalty=(
+                runtime_profile.repetition_penalty
+                if repetition_penalty is None
+                else float(repetition_penalty)
             ),
         )
     )
