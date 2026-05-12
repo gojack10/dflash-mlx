@@ -45,6 +45,8 @@ class RuntimeProfile:
     ddtree_max_depth: int = 0
     ddtree_depth_penalty: float = 0.0
     ddtree_use_log_softmax: bool = False
+    ddtree_dynamic_threshold: str = ""
+    ddtree_truncate_logw: float = float('-inf')
     generation_snapshot: bool = True
     repetition_penalty: float = 1.0
 
@@ -77,6 +79,8 @@ class EffectiveRuntimeConfig:
     ddtree_max_depth: int
     ddtree_depth_penalty: float
     ddtree_use_log_softmax: bool
+    ddtree_dynamic_threshold: str
+    ddtree_truncate_logw: float
     generation_snapshot: bool
     repetition_penalty: float
 
@@ -324,6 +328,16 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             getattr(args, "ddtree_use_log_softmax", None),
             "DFLASH_DDTREE_USE_LOG_SOFTMAX",
             profile.ddtree_use_log_softmax,
+        ),
+        ddtree_dynamic_threshold=_resolve_str(
+            getattr(args, "ddtree_dynamic_threshold", None),
+            "DFLASH_DDTREE_DYNAMIC_THRESHOLD",
+            profile.ddtree_dynamic_threshold,
+        ),
+        ddtree_truncate_logw=_resolve_float(
+            getattr(args, "ddtree_truncate_logw", None),
+            "DFLASH_DDTREE_TRUNCATE_LOGW",
+            profile.ddtree_truncate_logw,
         ),
         generation_snapshot=_resolve_bool(
             getattr(args, "generation_snapshot", None),

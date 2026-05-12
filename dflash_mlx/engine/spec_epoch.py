@@ -709,6 +709,9 @@ def stream_dflash_generate_impl(
         ddtree_max_depth = int(getattr(runtime_config, "ddtree_max_depth", 0) or 0)
         ddtree_depth_penalty = float(getattr(runtime_config, "ddtree_depth_penalty", 0.0) or 0.0)
         ddtree_use_log_softmax = bool(getattr(runtime_config, "ddtree_use_log_softmax", False))
+        ddtree_dynamic_threshold = str(getattr(runtime_config, "ddtree_dynamic_threshold", "") or "")
+        _tlw = getattr(runtime_config, "ddtree_truncate_logw", None)
+        ddtree_truncate_logw = float('-inf') if _tlw is None else float(_tlw)
         ddtree_profile_totals_ns = {
             "tree_build": 0,
             "compile": 0,
@@ -883,6 +886,8 @@ def stream_dflash_generate_impl(
                     min_cumulative_log_prob=ddtree_min_log_prob,
                     max_depth=ddtree_max_depth,
                     depth_penalty=ddtree_depth_penalty,
+                    dynamic_threshold=ddtree_dynamic_threshold,
+                    truncate_logw=ddtree_truncate_logw,
                 )
                 mx.eval()  # sync: tree build complete, CPU data ready
                 ddtree_tree_build_ns = time.perf_counter_ns() - _tree_build_start_ns
