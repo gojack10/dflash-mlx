@@ -153,12 +153,18 @@ class EagerDraftBackend:
         mask_token_tail: mx.array,
         topk: int,
         suppress_token_mask: Optional[mx.array],
+        use_log_softmax: bool = False,
     ) -> tuple[mx.array, mx.array, mx.array]:
         """Return greedy draft tokens plus top-k log-probs for DDTree.
 
         Keeps full-vocab logits on device and transfers only top-k IDs/log-probs
         to the tree builder. This avoids a second top-k/argmax pass in the
         DDTree loop and keeps the full logits tensor scoped to this method.
+
+        When ``use_log_softmax`` is True, returns actual log-probabilities
+        (log-softmax) instead of centered logit differences.  This adds one
+        logsumexp reduction per position but restores the original cumulative-
+        log-probability semantics that the DDTree threshold was designed for.
         """
         logits = self._draft_logits_impl(
             target_model=target_model,
@@ -182,12 +188,16 @@ class EagerDraftBackend:
         top_token_ids = mx.take_along_axis(top_indices, sort_order, axis=-1).astype(mx.uint32)
         top_logits = mx.take_along_axis(top_logits, sort_order, axis=-1)
         # DDTree only needs proposal scores to rank draft branches; target
-        # verification remains exact.  A full-vocab logsumexp here adds a
-        # second expensive reduction over the 248k Qwen vocabulary every draft
-        # cycle.  Center scores on the local best top-k logit instead: this
-        # preserves within-position ordering and gap information while avoiding
-        # the full softmax normalization.
-        top_scores = (top_logits - top_logits[:, :, :1]).astype(mx.float32)
+        # verification remains exact.  When use_log_softmax=False (default),
+        # center scores on the local best top-k logit: this preserves
+        # within-position ordering while avoiding the full softmax normalization.
+        # When use_log_softmax=True, compute actual log-probabilities via
+        # logsumexp — adds one vocabulary-sized reduction per position but
+        # makes cumulative log-probability semantics correct for threshold pruning.
+        if use_log_softmax:
+            top_scores = (top_logits - mx.logsumexp(dlogits, axis=-1, keepdims=True)).astype(mx.float32)
+        else:
+            top_scores = (top_logits - top_logits[:, :, :1]).astype(mx.float32)
         return greedy, top_token_ids.squeeze(0), top_scores.squeeze(0)
 
 

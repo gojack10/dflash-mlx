@@ -706,6 +706,9 @@ def stream_dflash_generate_impl(
         ddtree_topk = int(getattr(runtime_config, "ddtree_topk", 64) or 64)
         _mlp = getattr(runtime_config, "ddtree_min_log_prob", None)
         ddtree_min_log_prob = float('-inf') if _mlp is None else float(_mlp)
+        ddtree_max_depth = int(getattr(runtime_config, "ddtree_max_depth", 0) or 0)
+        ddtree_depth_penalty = float(getattr(runtime_config, "ddtree_depth_penalty", 0.0) or 0.0)
+        ddtree_use_log_softmax = bool(getattr(runtime_config, "ddtree_use_log_softmax", False))
         ddtree_profile_totals_ns = {
             "tree_build": 0,
             "compile": 0,
@@ -818,6 +821,7 @@ def stream_dflash_generate_impl(
                             mask_token_tail=mask_token_tail,
                             topk=min(ddtree_topk, ddtree_budget),
                             suppress_token_mask=suppress_token_mask,
+                            use_log_softmax=ddtree_use_log_softmax,
                         )
                         if profile_cycles:
                             mx.eval(drafted, draft_tree_top_ids, draft_tree_top_log_probs)
@@ -877,6 +881,8 @@ def stream_dflash_generate_impl(
                     budget=ddtree_budget,
                     profile=ddtree_tree_profile,
                     min_cumulative_log_prob=ddtree_min_log_prob,
+                    max_depth=ddtree_max_depth,
+                    depth_penalty=ddtree_depth_penalty,
                 )
                 mx.eval()  # sync: tree build complete, CPU data ready
                 ddtree_tree_build_ns = time.perf_counter_ns() - _tree_build_start_ns
@@ -1220,6 +1226,7 @@ def stream_dflash_generate_impl(
                             mask_token_tail=mask_token_tail,
                             topk=next_topk,
                             suppress_token_mask=suppress_token_mask,
+                            use_log_softmax=ddtree_use_log_softmax,
                         )
                         mx.async_eval(next_drafted, next_top_ids, next_top_log_probs)
                         launch_ns = time.perf_counter_ns() - draft_start_ns

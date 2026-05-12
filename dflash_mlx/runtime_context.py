@@ -52,6 +52,9 @@ def runtime_config_from_profile(
     ddtree_topk: int | None = None,
     ddtree_dense_mask: bool | None = None,
     ddtree_min_log_prob: float | None = None,
+    ddtree_max_depth: int | None = None,
+    ddtree_depth_penalty: float | None = None,
+    ddtree_use_log_softmax: bool | None = None,
     generation_snapshot: bool | None = None,
     repetition_penalty: float | None = None,
 ) -> EffectiveRuntimeConfig:
@@ -123,6 +126,9 @@ def runtime_config_from_profile(
             ddtree_topk=runtime_profile.ddtree_topk if ddtree_topk is None else int(ddtree_topk),
             ddtree_dense_mask=runtime_profile.ddtree_dense_mask if ddtree_dense_mask is None else bool(ddtree_dense_mask),
             ddtree_min_log_prob=runtime_profile.ddtree_min_log_prob if ddtree_min_log_prob is None else float(ddtree_min_log_prob),
+            ddtree_max_depth=runtime_profile.ddtree_max_depth if ddtree_max_depth is None else int(ddtree_max_depth),
+            ddtree_depth_penalty=runtime_profile.ddtree_depth_penalty if ddtree_depth_penalty is None else float(ddtree_depth_penalty),
+            ddtree_use_log_softmax=runtime_profile.ddtree_use_log_softmax if ddtree_use_log_softmax is None else bool(ddtree_use_log_softmax),
             generation_snapshot=(
                 runtime_profile.generation_snapshot
                 if generation_snapshot is None

@@ -42,6 +42,9 @@ class RuntimeProfile:
     ddtree_topk: int = 64
     ddtree_dense_mask: bool = False
     ddtree_min_log_prob: float = float('-inf')
+    ddtree_max_depth: int = 0
+    ddtree_depth_penalty: float = 0.0
+    ddtree_use_log_softmax: bool = False
     generation_snapshot: bool = True
     repetition_penalty: float = 1.0
 
@@ -71,6 +74,9 @@ class EffectiveRuntimeConfig:
     ddtree_topk: int
     ddtree_dense_mask: bool
     ddtree_min_log_prob: float
+    ddtree_max_depth: int
+    ddtree_depth_penalty: float
+    ddtree_use_log_softmax: bool
     generation_snapshot: bool
     repetition_penalty: float
 
@@ -303,6 +309,21 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             getattr(args, "ddtree_min_log_prob", None),
             "DFLASH_DDTREE_MIN_LOG_PROB",
             profile.ddtree_min_log_prob,
+        ),
+        ddtree_max_depth=_resolve_int(
+            getattr(args, "ddtree_max_depth", None),
+            "DFLASH_DDTREE_MAX_DEPTH",
+            profile.ddtree_max_depth,
+        ),
+        ddtree_depth_penalty=_resolve_float(
+            getattr(args, "ddtree_depth_penalty", None),
+            "DFLASH_DDTREE_DEPTH_PENALTY",
+            profile.ddtree_depth_penalty,
+        ),
+        ddtree_use_log_softmax=_resolve_bool(
+            getattr(args, "ddtree_use_log_softmax", None),
+            "DFLASH_DDTREE_USE_LOG_SOFTMAX",
+            profile.ddtree_use_log_softmax,
         ),
         generation_snapshot=_resolve_bool(
             getattr(args, "generation_snapshot", None),

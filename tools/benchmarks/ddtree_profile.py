@@ -57,6 +57,9 @@ def run_benchmark(
     ddtree_budget: int = 12,
     ddtree_topk: int = 12,
     ddtree_min_log_prob: float = float('-inf'),
+    ddtree_max_depth: int = 0,
+    ddtree_depth_penalty: float = 0.0,
+    ddtree_use_log_softmax: bool = False,
     repetition_penalty: float = 1.0,
     prefill_step_size: int | None = None,
     draft_block_tokens: int | None = None,
@@ -74,6 +77,9 @@ def run_benchmark(
         ddtree_budget=ddtree_budget,
         ddtree_topk=ddtree_topk,
         ddtree_min_log_prob=ddtree_min_log_prob,
+        ddtree_max_depth=ddtree_max_depth,
+        ddtree_depth_penalty=ddtree_depth_penalty,
+        ddtree_use_log_softmax=ddtree_use_log_softmax,
         repetition_penalty=repetition_penalty,
         prefill_step_size=prefill_step_size,
         draft_block_tokens=draft_block_tokens,
@@ -271,6 +277,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ddtree-topk", type=int, default=12)
     p.add_argument("--ddtree-min-log-prob", type=float, default=float('-inf'),
                    help="Prune DDTree paths below cumulative log-prob threshold (default: -inf = no pruning)")
+    p.add_argument("--ddtree-max-depth", type=int, default=0,
+                   help="Maximum DDTree depth (0=unlimited). Caps rank-0 chain length.")
+    p.add_argument("--ddtree-depth-penalty", type=float, default=0.0,
+                   help="Per-depth penalty added to child cumulative score (0.0=none)")
+    p.add_argument("--ddtree-use-log-softmax", action="store_true",
+                   help="Use actual log-softmax probabilities instead of centered scores")
     p.add_argument("--repetition-penalty", type=float, default=1.0)
     p.add_argument("--prefill-step-size", type=int, default=None)
     p.add_argument("--draft-block-tokens", type=int, default=None)
@@ -291,6 +303,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         ddtree_budget=args.ddtree_budget,
         ddtree_topk=args.ddtree_topk,
         ddtree_min_log_prob=args.ddtree_min_log_prob,
+        ddtree_max_depth=args.ddtree_max_depth,
+        ddtree_depth_penalty=args.ddtree_depth_penalty,
+        ddtree_use_log_softmax=args.ddtree_use_log_softmax,
         repetition_penalty=args.repetition_penalty,
         prefill_step_size=args.prefill_step_size,
         draft_block_tokens=args.draft_block_tokens,
