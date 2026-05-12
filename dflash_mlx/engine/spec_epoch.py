@@ -704,7 +704,8 @@ def stream_dflash_generate_impl(
         ddtree_mode = str(getattr(runtime_config, "speculative_mode", "dflash")).lower() == "ddtree"
         ddtree_budget = int(getattr(runtime_config, "ddtree_budget", 64) or 64)
         ddtree_topk = int(getattr(runtime_config, "ddtree_topk", 64) or 64)
-        ddtree_min_log_prob = float(getattr(runtime_config, "ddtree_min_log_prob", float('-inf')) or float('-inf'))
+        _mlp = getattr(runtime_config, "ddtree_min_log_prob", None)
+        ddtree_min_log_prob = float('-inf') if _mlp is None else float(_mlp)
         ddtree_profile_totals_ns = {
             "tree_build": 0,
             "compile": 0,
