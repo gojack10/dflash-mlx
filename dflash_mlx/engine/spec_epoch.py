@@ -704,6 +704,7 @@ def stream_dflash_generate_impl(
         ddtree_mode = str(getattr(runtime_config, "speculative_mode", "dflash")).lower() == "ddtree"
         ddtree_budget = int(getattr(runtime_config, "ddtree_budget", 64) or 64)
         ddtree_topk = int(getattr(runtime_config, "ddtree_topk", 64) or 64)
+        ddtree_min_log_prob = float(getattr(runtime_config, "ddtree_min_log_prob", float('-inf')) or float('-inf'))
         ddtree_profile_totals_ns = {
             "tree_build": 0,
             "compile": 0,
@@ -874,6 +875,7 @@ def stream_dflash_generate_impl(
                     draft_tree_top_log_probs,
                     budget=ddtree_budget,
                     profile=ddtree_tree_profile,
+                    min_cumulative_log_prob=ddtree_min_log_prob,
                 )
                 mx.eval()  # sync: tree build complete, CPU data ready
                 ddtree_tree_build_ns = time.perf_counter_ns() - _tree_build_start_ns

@@ -41,6 +41,7 @@ class RuntimeProfile:
     ddtree_budget: int = 12
     ddtree_topk: int = 64
     ddtree_dense_mask: bool = False
+    ddtree_min_log_prob: float = float('-inf')
     generation_snapshot: bool = True
     repetition_penalty: float = 1.0
 
@@ -69,6 +70,7 @@ class EffectiveRuntimeConfig:
     ddtree_budget: int
     ddtree_topk: int
     ddtree_dense_mask: bool
+    ddtree_min_log_prob: float
     generation_snapshot: bool
     repetition_penalty: float
 
@@ -296,6 +298,11 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             getattr(args, "ddtree_dense_mask", None),
             "DFLASH_DDTREE_DENSE_MASK",
             profile.ddtree_dense_mask,
+        ),
+        ddtree_min_log_prob=_resolve_float(
+            getattr(args, "ddtree_min_log_prob", None),
+            "DFLASH_DDTREE_MIN_LOG_PROB",
+            profile.ddtree_min_log_prob,
         ),
         generation_snapshot=_resolve_bool(
             getattr(args, "generation_snapshot", None),
