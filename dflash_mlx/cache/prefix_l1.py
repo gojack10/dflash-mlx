@@ -48,6 +48,7 @@ class DFlashPrefixCache:
             "fingerprint_rejects": 0,
             "l2_hits": 0,
             "l2_misses": 0,
+            "l2_spills": 0,
         }
 
     def lookup(
@@ -146,6 +147,13 @@ class DFlashPrefixCache:
             first_divergence_pos=first_div,
             elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
         )
+
+        # L1 miss: spill all current entries to L2 (if available) to free GPU
+        # memory for the incoming cold prefill.  Without this, stale entries from
+        # previous requests accumulate in GPU memory and cause OOM when the new
+        # prefill's KV cache + activations push the total over the Metal limit.
+        # Spilling preserves the snapshots on SSD for future L2 hits.
+        self._spill_all_to_l2()
 
         if self._l2 is None:
             return (0, None)
@@ -340,6 +348,26 @@ class DFlashPrefixCache:
                     self._stats["byte_budget_evictions"] += 1
                 if self._l2 is not None:
                     self._l2.insert_async(evicted)
+
+    def _spill_all_to_l2(self) -> None:
+        """Evict all current L1 entries to L2 (SSD), freeing GPU memory.
+
+        Called on L1 lookup miss \u2014 the stale entries are useless for the
+        incoming request but may be useful later via L2 restore (50-100ms).
+        """
+        with self._lock:
+            if not self._entries:
+                return
+            if self._l2 is None:
+                # No L2 configured \u2014 just drop them.
+                self._entries.clear()
+                self._lru_order.clear()
+                return
+            for eid, snap in list(self._entries.items()):
+                self._l2.insert_async(snap)
+                self._stats["l2_spills"] = self._stats.get("l2_spills", 0) + 1
+            self._entries.clear()
+            self._lru_order.clear()
 
     def _current_bytes(self) -> int:
         return sum(s.nbytes for s in self._entries.values())

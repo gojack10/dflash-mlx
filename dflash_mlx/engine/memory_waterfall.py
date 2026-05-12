@@ -130,6 +130,7 @@ def prefix_cache_bytes(prefix_cache: Any) -> dict[str, int]:
         "l2_hits": 0,
         "l2_writes": 0,
         "l2_misses": 0,
+        "l2_spills": 0,
     }
     if prefix_cache is None:
         return out
@@ -143,6 +144,7 @@ def prefix_cache_bytes(prefix_cache: Any) -> dict[str, int]:
     out["byte_budget_evictions"] = int(stats.get("byte_budget_evictions", 0) or 0)
     out["l2_hits"] = int(stats.get("l2_hits", 0) or 0)
     out["l2_misses"] = int(stats.get("l2_misses", 0) or 0)
+    out["l2_spills"] = int(stats.get("l2_spills", 0) or 0)
     l2 = stats.get("l2") if isinstance(stats.get("l2"), dict) else {}
     out["l2_disk_bytes"] = int(l2.get("current_bytes", 0) or 0)
     out["l2_writes"] = int(l2.get("writes", 0) or 0)
