@@ -642,6 +642,7 @@ def stream_dflash_generate_impl(
                 "generated_tokens": 1,
                 "acceptance_ratio": 0.0,
                 "cycles_completed": 0,
+                "decode_elapsed_us": (time.perf_counter_ns() - decode_start_ns) / 1_000.0,
             }
             _yield_done(_pre_yield)
 
@@ -1255,6 +1256,7 @@ def stream_dflash_generate_impl(
                         accepted_from_draft / len(generated_token_ids) if generated_token_ids else 0.0
                     ),
                     "cycles_completed": cycles_completed,
+                    "decode_elapsed_us": (time.perf_counter_ns() - decode_start_ns) / 1_000.0,
                 }
                 _yield_done(_pre_yield)
 
