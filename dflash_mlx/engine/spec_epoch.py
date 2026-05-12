@@ -893,7 +893,7 @@ def stream_dflash_generate_impl(
                     )
                     sys.stderr.flush()
 
-                # Arm rollback, verify tree forward, walk
+                # Arm rollback, verify tree forward (skip LM head — compute lazily per-node during walk)
                 target_ops.arm_rollback(target_cache, prefix_len=start)
                 verify_start_ns = time.perf_counter_ns()
                 tree_cache_state: dict[str, Any] = {}
@@ -904,12 +904,12 @@ def stream_dflash_generate_impl(
                     cache=target_cache,
                     capture_layer_ids=capture_layer_ids,
                     tree_cache_state=tree_cache_state,
+                    compute_logits=False,  # skip LM head — compute per-node during walk
                     profile=ddtree_verify_profile if profile_cycles else None,
                 )
-                if profile_cycles:
-                    mx.eval(tree_logits)
-                else:
-                    mx.eval()  # sync: verify forward complete
+                # Force evaluation of the forward pass NOW so its cost is attributed
+                # to target_verify, not posterior_argmax.
+                mx.eval(tree_cache_state["normalized_hidden"])
                 verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
                 verify_ns_total += verify_cycle_ns
                 if ddtree_debug:
@@ -918,14 +918,12 @@ def stream_dflash_generate_impl(
                     )
                     sys.stderr.flush()
 
-                # Walk tree. This includes the lazy full-tree LM head when
-                # diagnostics/full is off; request logs expose that cost as
-                # ddtree_timing_avg_us.posterior_argmax.
+                # ── Compute posterior for all tree nodes in one batch.
+                # normalized_hidden was already evaluated above (attributed to target_verify).
                 _posterior_start_ns = time.perf_counter_ns()
+                normalized_hidden = tree_cache_state["normalized_hidden"]  # [1, tree_size, D]
                 if stochastic_decode:
-                    # Direct-sample from target distribution at every tree node, then walk
-                    # the tree following sampled tokens. Provably preserves target marginal
-                    # at each emitted position (sampled ~ p(node) directly).
+                    tree_logits = target_ops.logits_from_hidden(target_model, normalized_hidden)
                     target_probs_tree = compute_target_probs(
                         tree_logits[0],
                         temperature=temperature,
@@ -934,13 +932,19 @@ def stream_dflash_generate_impl(
                         generated_token_ids=_sampled_ids,
                         rep_penalty=rep_penalty,
                     )
-                    sampled_per_node_arr = batched_sample_from_probs(target_probs_tree)
-                    sampled_per_node = sampled_per_node_arr.tolist()
-                    posterior_list = sampled_per_node  # bonus / next-staged uses same source
+                    posterior_tokens = batched_sample_from_probs(target_probs_tree)
+                    posterior_list = posterior_tokens.tolist()
                 else:
-                    posterior_tokens = greedy_tokens_with_mask(
-                        apply_repetition_penalty(tree_logits[0], _sampled_ids, rep_penalty),
-                        suppress_token_mask,
+                    from dflash_mlx.fused_posterior import fused_penalty_argmax_python
+                    tree_logits = target_ops.logits_from_hidden(target_model, normalized_hidden)
+                    posterior_tokens = fused_penalty_argmax_python(
+                        tree_logits[0],
+                        penalty_ids=_sampled_ids,
+                        penalty=rep_penalty,
+                        suppress_token_ids=(
+                            [int(i) for i, v in enumerate(suppress_token_mask.tolist()) if v]
+                            if suppress_token_mask is not None else None
+                        ),
                     )
                     posterior_list = posterior_tokens.tolist()
                 ddtree_posterior_ns = time.perf_counter_ns() - _posterior_start_ns
@@ -957,16 +961,13 @@ def stream_dflash_generate_impl(
                 acceptance_len = len(accepted_indices) - 1  # minus root
                 acceptance_history.append(acceptance_len)
 
-                # ── Use tree logits directly, skip re-verify ──
-                # Extract accepted node logits and hidden states from tree results.
+                # ── Compute final accepted node logits (needed for generation snapshots) ──
                 _gather_start_ns = time.perf_counter_ns()
                 accepted_array = mx.array(accepted_indices, dtype=mx.int32)
                 final_accepted_array = mx.array([accepted_indices[-1]], dtype=mx.int32)
-                # Only the final accepted node's logits are needed after the
-                # tree walk (for generation snapshots / next-token state).
-                # Hidden states still need the full accepted path for the
-                # draft model context feature.
-                verify_logits = mx.take(tree_logits, final_accepted_array, axis=1)
+                # Compute logits for the final accepted node only
+                final_hidden = mx.take(normalized_hidden, final_accepted_array, axis=1)
+                verify_logits = target_ops.logits_from_hidden(target_model, final_hidden)
                 # Reconstruct hidden states for accepted nodes
                 captured_dict: dict[int, mx.array] = {}
                 for lid, hid in tree_hidden_states.items():
