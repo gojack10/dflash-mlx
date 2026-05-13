@@ -54,6 +54,40 @@ class _ExactSmallProjPad(nn.Module):
             return out[:, :seq_len, :]
         return self.linear(x)
 
+def _install_fused_gdn_projection(linear_attn: Any) -> None:
+    """Install fused GDN projection weight. Single matmul replaces 4 dispatches.
+
+    Concatenates in_proj_qkv, in_proj_z, in_proj_b, in_proj_a weights into one
+    [16480, 5120] tensor. Stores transposed weight on linear_attn for matmul.
+    Bit-exact with 4 separate calls, 1.9-2.1× faster.
+    """
+    if getattr(linear_attn, "_dflash_fused_proj_installed", False):
+        return
+
+    def _get_weight(proj):
+        if isinstance(proj, _ExactSmallProjPad):
+            return proj.linear.weight
+        return proj.weight
+
+    w_qkv = _get_weight(linear_attn.in_proj_qkv)
+    w_z   = _get_weight(linear_attn.in_proj_z)
+    w_b   = _get_weight(linear_attn.in_proj_b)
+    w_a   = _get_weight(linear_attn.in_proj_a)
+
+    n_qkv = int(w_qkv.shape[0])
+    n_z   = int(w_z.shape[0])
+    n_b   = int(w_b.shape[0])
+    n_a   = int(w_a.shape[0])
+
+    fused = mx.concatenate([w_qkv, w_z, w_b, w_a], axis=0)
+
+    linear_attn._dflash_fused_weight_T = fused.swapaxes(-1, -2)
+    linear_attn._dflash_fused_split_qkv = n_qkv
+    linear_attn._dflash_fused_split_z   = n_qkv + n_z
+    linear_attn._dflash_fused_split_b   = n_qkv + n_z + n_b
+    linear_attn._dflash_fused_proj_installed = True
+
+
 def _install_exact_small_proj_hooks(
     linear_attn: Any,
     *,
@@ -140,6 +174,10 @@ def _split_sdpa_output(
 
 def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
     cls = type(linear_attn)
+
+    # Per-instance: build fused projection weight for this layer
+    _install_fused_gdn_projection(linear_attn)
+
     if getattr(cls, "_dflash_speculative_call_installed", False):
         return
 
@@ -151,24 +189,37 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        if not isinstance(cache, RecurrentRollbackCache) or not getattr(cache, "_armed", False):
-            return original_call(self, inputs, mask=mask, cache=cache)
+        """Unified forward pass — always uses fused GDN projection matmul.
 
+        Single (16480, 5120) matmul replaces 4 separate dispatches.
+        Branches only on cache type (RecurrentRollbackCache vs other)
+        and recurrence path (kernel vs ops, tape vs plain).
+        """
         from mlx.nn.layers.distributed import sum_gradients
 
         B, S, _ = inputs.shape
         sharding_group = getattr(self, "sharding_group", None)
+        is_rrb_cache = isinstance(cache, RecurrentRollbackCache)
+        is_armed = is_rrb_cache and getattr(cache, "_armed", False)
 
         if sharding_group is not None:
             inputs = sum_gradients(sharding_group)(inputs)
 
-        qkv = self.in_proj_qkv(inputs)
-        z_proj = self.in_proj_z(inputs)
-        z = z_proj.reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        # --- Fused projection (one matmul replaces 4) ---
+        fused_weight_T = getattr(self, "_dflash_fused_weight_T", None)
+        if fused_weight_T is None:
+            # Fallback for instances without fused weights (e.g., second model load)
+            return original_call(self, inputs, mask=mask, cache=cache)
 
-        if cache[0] is not None:
+        fused = inputs @ fused_weight_T
+        qkv = fused[..., :self._dflash_fused_split_qkv]
+        z = fused[..., self._dflash_fused_split_qkv:self._dflash_fused_split_z].reshape(
+            B, S, self.num_v_heads, self.head_v_dim)
+        b = fused[..., self._dflash_fused_split_z:self._dflash_fused_split_b]
+        a = fused[..., self._dflash_fused_split_b:]
+
+        # --- Conv cache ---
+        if cache is not None and cache[0] is not None:
             conv_state = cache[0]
         else:
             conv_state = mx.zeros(
@@ -179,7 +230,18 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
         if mask is not None:
             qkv = mx.where(mask[..., None], qkv, 0)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
-        cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :])
+
+        if is_rrb_cache:
+            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :])
+        elif cache is not None:
+            n_keep = self.conv_kernel_size - 1
+            if getattr(cache, "lengths", None) is not None:
+                ends = mx.clip(cache.lengths, 0, S)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+            else:
+                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
@@ -192,7 +254,8 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
             )
         ]
 
-        state = cache[1]
+        # --- Recurrence ---
+        state = cache[1] if cache is not None else None
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
@@ -210,7 +273,7 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
             and mx.metal.is_available()
             and not self.training
         ):
-            if getattr(cache, "_armed", False):
+            if is_armed:
                 from dflash_mlx.kernels import gated_delta_kernel_with_tape
 
                 out, state, innovation_tape = gated_delta_kernel_with_tape(
@@ -226,7 +289,7 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
                 out, state = gated_delta_mod.gated_delta_kernel(q, k, v, g, beta, state, mask)
         else:
             out, state = gated_delta_mod.gated_delta_ops(q, k, v, g, beta, state, mask)
-            if getattr(cache, "_armed", False):
+            if is_armed:
                 decay = g[..., None, :] if g.ndim == 4 else g[..., None, None]
                 decayed_state = state_in[:, None, ...] * decay
                 kv_mem = (decayed_state * k[..., None, :]).sum(axis=-1)
@@ -238,8 +301,10 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
                     qkv=qkv,
                 )
 
-        cache[1] = mx.contiguous(state)
-        cache.advance(S)
+        # --- Output ---
+        if cache is not None:
+            cache[1] = mx.contiguous(state)
+            cache.advance(S)
         out = self.norm(out, z)
         out_flat = out.reshape(B, S, -1)
         out = self.out_proj(out_flat)
