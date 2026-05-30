@@ -1,3 +1,22 @@
+# Fork: Jack ten Bosch  DDTree + Checkpoint Optimizations
+
+Fork of bstnxbt/dflash-mlx. I added:
+
+- DDTree speculative decode mode
+  - Draft logits API, calibrated log-weight tracking, dynamic threshold, truncation, depth cap with penalty.
+  - Fused GDN projection: single (16480,5120) matmul replaces 4 dispatches.
+  - My review: DDTree mode works as a verifier and the GDN fusion holds quality.
+- Checkpoint and cache improvements
+  - L2-only checkpoint snapshots, checkpoint preservation, compact rotating KV after DDTree commit.
+  - L1-to-L2 spill on lookup miss, prefix cache with target FA window.
+- Runtime fixes
+  - Repetition penalty for draft and target, stochastic decode via direct target-distribution sampling.
+  - Live server metrics endpoint.
+
+All work lives on this branch. Not yet merged to upstream.
+
+---
+
 <p align="center">
   <h1 align="center">dflash-mlx</h1>
   <p align="center">DFlash speculative decoding for Apple Silicon (MLX)</p>
