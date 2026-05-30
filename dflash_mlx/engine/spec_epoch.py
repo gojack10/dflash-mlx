@@ -517,6 +517,7 @@ def stream_dflash_generate_impl(
                 "from_snapshot": bool(snap_prefix_len > 0),
                 "snap_prefix_len": snap_prefix_len,
                 "snapshot_boundary": snapshot_boundary,
+                "checkpoint": True,
             }
             _yield_done(_pre_yield)
             evt = _waterfall_event(
